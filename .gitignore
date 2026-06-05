@@ -34,3 +34,10 @@ dmypy.json
 *.swo
 *~
 .DS_Store
+
+# Agent/prompt documentation (local use only)
+AGENT.md
+AGENT2.md
+AGENT3.md
+PROMPTS.md
+CLAUDE.md
