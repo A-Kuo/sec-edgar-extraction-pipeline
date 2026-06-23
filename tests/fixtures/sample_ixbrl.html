@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"
+      xmlns:xbrli="http://www.xbrl.org/2003/instance"
+      xmlns:xbrldi="http://xbrl.org/2006/xbrldi"
+      xmlns:us-gaap="http://fasb.org/us-gaap/2023"
+      xmlns:ixt="http://www.xbrl.org/inlineXBRL/transformation/2022-02-16">
+<head><title>Sample Annual Report (Apple Inc. — FY2024 fixture)</title></head>
+<body>
+<ix:header>
+  <ix:resources>
+
+    <!-- ── Duration context (income statement items) ── -->
+    <xbrli:context id="FY2024_DURATION">
+      <xbrli:entity>
+        <xbrli:identifier scheme="http://www.sec.gov/cgi-bin/browse-edgar?action=getcompany">0000320193</xbrli:identifier>
+      </xbrli:entity>
+      <xbrli:period>
+        <xbrli:startDate>2023-10-01</xbrli:startDate>
+        <xbrli:endDate>2024-09-28</xbrli:endDate>
+      </xbrli:period>
+    </xbrli:context>
+
+    <!-- ── Instant context (balance sheet items) ── -->
+    <xbrli:context id="FY2024_INSTANT">
+      <xbrli:entity>
+        <xbrli:identifier scheme="http://www.sec.gov/cgi-bin/browse-edgar?action=getcompany">0000320193</xbrli:identifier>
+      </xbrli:entity>
+      <xbrli:period>
+        <xbrli:instant>2024-09-28</xbrli:instant>
+      </xbrli:period>
+    </xbrli:context>
+
+    <!-- ── Segment context (Products segment, duration) ── -->
+    <xbrli:context id="FY2024_PRODUCTS">
+      <xbrli:entity>
+        <xbrli:identifier scheme="http://www.sec.gov/cgi-bin/browse-edgar?action=getcompany">0000320193</xbrli:identifier>
+        <xbrli:segment>
+          <xbrldi:explicitMember dimension="us-gaap:StatementBusinessSegmentsAxis">aapl:ProductsMember</xbrldi:explicitMember>
+        </xbrli:segment>
+      </xbrli:entity>
+      <xbrli:period>
+        <xbrli:startDate>2023-10-01</xbrli:startDate>
+        <xbrli:endDate>2024-09-28</xbrli:endDate>
+      </xbrli:period>
+    </xbrli:context>
+
+    <!-- ── Units ── -->
+    <xbrli:unit id="USD">
+      <xbrli:measure>iso4217:USD</xbrli:measure>
+    </xbrli:unit>
+    <xbrli:unit id="shares">
+      <xbrli:measure>xbrli:shares</xbrli:measure>
+    </xbrli:unit>
+    <xbrli:unit id="USDPerShare">
+      <xbrli:divide>
+        <xbrli:unitNumerator><xbrli:measure>iso4217:USD</xbrli:measure></xbrli:unitNumerator>
+        <xbrli:unitDenominator><xbrli:measure>xbrli:shares</xbrli:measure></xbrli:unitDenominator>
+      </xbrli:divide>
+    </xbrli:unit>
+
+  </ix:resources>
+</ix:header>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     Income Statement (duration period)
+     All monetary values: scale="6" ⟹ reported number × 10^6 = USD
+     ═══════════════════════════════════════════════════════════════════ -->
+
+<p>Net sales:
+  <ix:nonFraction name="us-gaap:Revenues"
+      contextRef="FY2024_DURATION" unitRef="USD"
+      decimals="-6" scale="6" format="ixt:num-dot-decimal">391,035</ix:nonFraction>
+</p>
+
+<p>Net income:
+  <ix:nonFraction name="us-gaap:NetIncomeLoss"
+      contextRef="FY2024_DURATION" unitRef="USD"
+      decimals="-6" scale="6">93,736</ix:nonFraction>
+</p>
+
+<p>Operating income:
+  <ix:nonFraction name="us-gaap:OperatingIncomeLoss"
+      contextRef="FY2024_DURATION" unitRef="USD"
+      decimals="-6" scale="6">123,216</ix:nonFraction>
+</p>
+
+<p>Earnings per share — basic:
+  <ix:nonFraction name="us-gaap:EarningsPerShareBasic"
+      contextRef="FY2024_DURATION" unitRef="USDPerShare"
+      decimals="2">6.11</ix:nonFraction>
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     Balance Sheet (instant period)
+     ═══════════════════════════════════════════════════════════════════ -->
+
+<p>Total assets:
+  <ix:nonFraction name="us-gaap:Assets"
+      contextRef="FY2024_INSTANT" unitRef="USD"
+      decimals="-6" scale="6">364,980</ix:nonFraction>
+</p>
+
+<p>Total liabilities:
+  <ix:nonFraction name="us-gaap:Liabilities"
+      contextRef="FY2024_INSTANT" unitRef="USD"
+      decimals="-6" scale="6">308,030</ix:nonFraction>
+</p>
+
+<!-- Shares outstanding reported in thousands (scale="3") -->
+<p>Common shares outstanding:
+  <ix:nonFraction name="us-gaap:CommonStockSharesOutstanding"
+      contextRef="FY2024_INSTANT" unitRef="shares"
+      decimals="-3" scale="3">15,115,823</ix:nonFraction>
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     Segment disaggregation — Products revenue
+     ═══════════════════════════════════════════════════════════════════ -->
+
+<p>Products net sales:
+  <ix:nonFraction name="us-gaap:Revenues"
+      contextRef="FY2024_PRODUCTS" unitRef="USD"
+      decimals="-6" scale="6">294,866</ix:nonFraction>
+</p>
+
+<!-- Alias concept used by some filers instead of Revenues -->
+<p>Revenue from contracts:
+  <ix:nonFraction name="us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"
+      contextRef="FY2024_DURATION" unitRef="USD"
+      decimals="-6" scale="6">391,035</ix:nonFraction>
+</p>
+
+</body>
+</html>
