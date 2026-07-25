@@ -1,9 +1,9 @@
-import pytest
 import os
 from datetime import datetime
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import patch
+
+import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy.orm import Session
 
 os.environ["MOCK_EDGAR"] = "true"
 
@@ -14,6 +14,7 @@ from src.schema import FilingRaw, FinancialFact
 @pytest.fixture
 def client(db_session):
     """FastAPI test client with mocked database."""
+
     def override_get_db():
         yield db_session
 
@@ -34,7 +35,7 @@ def sample_filing(db_session):
         period_end=datetime(2023, 9, 30),
         document_url="https://www.sec.gov/Archives/...",
         raw_html="<html></html>",
-        pipeline_run_id="test-run-1"
+        pipeline_run_id="test-run-1",
     )
     db_session.add(filing)
     db_session.commit()
@@ -52,7 +53,7 @@ def sample_facts(db_session, sample_filing):
             period_start=None,
             period_end=datetime(2023, 9, 30),
             value=383285000000.0,
-            segment="Total"
+            segment="Total",
         ),
         FinancialFact(
             accession_number="0000320193-23-000077",
@@ -61,7 +62,7 @@ def sample_facts(db_session, sample_filing):
             period_start=None,
             period_end=datetime(2023, 9, 30),
             value=96995000000.0,
-            segment="Total"
+            segment="Total",
         ),
         FinancialFact(
             accession_number="0000320193-23-000077",
@@ -70,7 +71,7 @@ def sample_facts(db_session, sample_filing):
             period_start=None,
             period_end=datetime(2023, 9, 30),
             value=352755000000.0,
-            segment="Total"
+            segment="Total",
         ),
     ]
     for fact in facts:
@@ -105,7 +106,7 @@ class TestFilingsEndpoint:
     def test_get_filings_pagination(self, client, sample_filing, sample_facts, db_session):
         for i in range(15):
             filing = FilingRaw(
-                accession_number=f"0000320193-23-{1000+i:06d}",
+                accession_number=f"0000320193-23-{1000 + i:06d}",
                 cik="0000320193",
                 ticker="AAPL",
                 company_name="Apple Inc.",
@@ -114,7 +115,7 @@ class TestFilingsEndpoint:
                 period_end=datetime(2023, 9, 30),
                 document_url="https://www.sec.gov/Archives/...",
                 raw_html="<html></html>",
-                pipeline_run_id="test-run-1"
+                pipeline_run_id="test-run-1",
             )
             db_session.add(filing)
         db_session.commit()
@@ -188,7 +189,7 @@ class TestFactTimeSeriesEndpoint:
                 period_start=None,
                 period_end=datetime(2023, 9, 30),
                 value=383285000000.0,
-                segment="Total"
+                segment="Total",
             ),
             FinancialFact(
                 accession_number="0000320193-23-000078",
@@ -197,7 +198,7 @@ class TestFactTimeSeriesEndpoint:
                 period_start=None,
                 period_end=datetime(2022, 9, 30),
                 value=394328000000.0,
-                segment="Total"
+                segment="Total",
             ),
         ]
         for fact in facts:
@@ -213,7 +214,7 @@ class TestFactTimeSeriesEndpoint:
             period_end=datetime(2022, 9, 30),
             document_url="https://www.sec.gov/Archives/...",
             raw_html="<html></html>",
-            pipeline_run_id="test-run-1"
+            pipeline_run_id="test-run-1",
         )
         db_session.add(filing2)
         db_session.commit()

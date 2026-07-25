@@ -1,11 +1,10 @@
 import logging
-import json
 import os
 import smtplib
-from dataclasses import dataclass, asdict
-from email.mime.text import MIMEText
+from dataclasses import dataclass
 from email.mime.multipart import MIMEMultipart
-from typing import Optional
+from email.mime.text import MIMEText
+
 import requests
 
 logger = logging.getLogger(__name__)
@@ -16,8 +15,8 @@ class AlertPayload:
     run_id: str
     stage: str
     status: str
-    error_message: Optional[str] = None
-    row_count: Optional[int] = None
+    error_message: str | None = None
+    row_count: int | None = None
 
     def to_slack_format(self) -> dict:
         color = "danger" if self.status == "failed" else "good"
@@ -29,7 +28,7 @@ class AlertPayload:
                 {"title": "Status", "value": self.status, "short": True},
                 {"title": "Rows Processed", "value": str(self.row_count or 0), "short": True},
             ],
-            "text": self.error_message or "No errors"
+            "text": self.error_message or "No errors",
         }
 
     def to_plain_text(self) -> str:
@@ -40,7 +39,7 @@ Run ID: {self.run_id}
 Stage: {self.stage}
 Status: {self.status}
 Rows: {self.row_count or 0}
-Error: {self.error_message or 'None'}
+Error: {self.error_message or "None"}
 """
 
 
@@ -53,11 +52,7 @@ def send_alert(payload: AlertPayload) -> None:
     if slack_url:
         try:
             response = requests.post(
-                slack_url,
-                json={
-                    "attachments": [payload.to_slack_format()]
-                },
-                timeout=5
+                slack_url, json={"attachments": [payload.to_slack_format()]}, timeout=5
             )
             response.raise_for_status()
             logger.info(f"Alert sent to Slack for {payload.run_id}")
@@ -85,10 +80,5 @@ def send_alert(payload: AlertPayload) -> None:
 
 def send_pipeline_failure_alert(run_id: str, stage: str, error: str) -> None:
     """Convenience wrapper for pipeline failures."""
-    payload = AlertPayload(
-        run_id=run_id,
-        stage=stage,
-        status="failed",
-        error_message=error
-    )
+    payload = AlertPayload(run_id=run_id, stage=stage, status="failed", error_message=error)
     send_alert(payload)

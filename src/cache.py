@@ -1,6 +1,7 @@
 import json
 import logging
-from typing import Optional, Any
+from typing import Any
+
 import redis
 from redis.connection import ConnectionPool
 
@@ -11,7 +12,9 @@ class FilingCache:
     def __init__(self, redis_url: str = "redis://localhost:6379/0"):
         self.redis_url = redis_url
         try:
-            self.pool = ConnectionPool.from_url(redis_url, max_connections=20, decode_responses=True)
+            self.pool = ConnectionPool.from_url(
+                redis_url, max_connections=20, decode_responses=True
+            )
             self.client = redis.Redis(connection_pool=self.pool)
             self.client.ping()
         except Exception as e:
@@ -26,7 +29,7 @@ class FilingCache:
         except Exception as e:
             logger.error(f"Failed to set cik:{ticker}: {e}")
 
-    def get_cik_ticker(self, ticker: str) -> Optional[str]:
+    def get_cik_ticker(self, ticker: str) -> str | None:
         if not self.client:
             return None
         try:
@@ -43,7 +46,7 @@ class FilingCache:
         except Exception as e:
             logger.error(f"Failed to set filings:{cik}: {e}")
 
-    def get_filings(self, cik: str) -> Optional[Any]:
+    def get_filings(self, cik: str) -> Any | None:
         if not self.client:
             return None
         try:
@@ -61,7 +64,7 @@ class FilingCache:
         except Exception as e:
             logger.error(f"Failed to set facts:{accession_number}: {e}")
 
-    def get_facts(self, accession_number: str) -> Optional[Any]:
+    def get_facts(self, accession_number: str) -> Any | None:
         if not self.client:
             return None
         try:

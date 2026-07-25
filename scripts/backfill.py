@@ -10,19 +10,17 @@ import argparse
 import logging
 import os
 from datetime import datetime
-from typing import List
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from src.schema import FilingRaw, FinancialFact, Base
-from src.edgar_client import EdgarClient
-from src.xbrl_parser import XBRLParser
 from src.cache import FilingCache
+from src.edgar_client import EdgarClient
+from src.schema import Base, FilingRaw, FinancialFact
+from src.xbrl_parser import XBRLParser
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -30,11 +28,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://sec_user:sec_pass@localho
 USER_AGENT = os.getenv("SEC_USER_AGENT", "SEC-EDGAR-Pipeline aus.kuo03@gmail.com")
 
 
-def backfill_historical_data(
-    cik: str,
-    start_date: datetime,
-    end_date: datetime
-) -> None:
+def backfill_historical_data(cik: str, start_date: datetime, end_date: datetime) -> None:
     """Backfill historical filing data for a CIK."""
     engine = create_engine(DATABASE_URL)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -91,9 +85,11 @@ def backfill_historical_data(
                 logger.warning(f"Invalid period end: {period_end_str}")
                 continue
 
-            existing = session.query(FilingRaw).filter(
-                FilingRaw.accession_number == accession_number
-            ).first()
+            existing = (
+                session.query(FilingRaw)
+                .filter(FilingRaw.accession_number == accession_number)
+                .first()
+            )
 
             if existing:
                 logger.debug(f"Filing {accession_number} already exists, skipping")
@@ -118,7 +114,7 @@ def backfill_historical_data(
                 period_end=period_end,
                 document_url=document_url,
                 raw_html=raw_html,
-                pipeline_run_id=f"backfill-{cik}-{datetime.utcnow().isoformat()}"
+                pipeline_run_id=f"backfill-{cik}-{datetime.utcnow().isoformat()}",
             )
 
             session.add(filing_raw)
@@ -133,7 +129,7 @@ def backfill_historical_data(
                     period_start=fact.period_start,
                     period_end=fact.period_end,
                     value=fact.value,
-                    segment=fact.segment
+                    segment=fact.segment,
                 )
                 session.add(financial_fact)
 

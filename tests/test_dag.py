@@ -1,6 +1,5 @@
-import pytest
-from datetime import datetime
 import os
+from datetime import datetime
 
 os.environ["MOCK_EDGAR"] = "true"
 
@@ -36,7 +35,6 @@ class TestDAGStructure:
         validate_task = task_dict["validate_quality_gates"]
         load_task = task_dict["load_to_warehouse"]
         audit_task = task_dict["update_audit_trail"]
-        alert_task = task_dict["send_alerts_on_failure"]
 
         assert download_task in fetch_task.downstream_list
         assert parse_task in download_task.downstream_list

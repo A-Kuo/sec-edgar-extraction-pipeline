@@ -9,17 +9,15 @@ Usage:
 import argparse
 import logging
 import os
-from typing import Dict, List
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from src.schema import FilingRaw, FinancialFact, PipelineAudit
 from src.quality import check_completeness, check_psi_drift
+from src.schema import FilingRaw, FinancialFact, PipelineAudit
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -35,9 +33,7 @@ def validate_run(run_id: str) -> None:
     try:
         logger.info(f"Starting validation for run {run_id}")
 
-        audit_records = session.query(PipelineAudit).filter(
-            PipelineAudit.run_id == run_id
-        ).all()
+        audit_records = session.query(PipelineAudit).filter(PipelineAudit.run_id == run_id).all()
 
         if not audit_records:
             logger.warning(f"No audit records found for run {run_id}")
@@ -45,9 +41,7 @@ def validate_run(run_id: str) -> None:
 
         logger.info(f"Found {len(audit_records)} audit records for run {run_id}")
 
-        filings = session.query(FilingRaw).filter(
-            FilingRaw.pipeline_run_id == run_id
-        ).all()
+        filings = session.query(FilingRaw).filter(FilingRaw.pipeline_run_id == run_id).all()
 
         if not filings:
             logger.warning(f"No filings found for run {run_id}")
@@ -55,11 +49,13 @@ def validate_run(run_id: str) -> None:
 
         logger.info(f"Found {len(filings)} filings for run {run_id}")
 
-        facts_by_accession: Dict[str, List[FinancialFact]] = {}
+        facts_by_accession: dict[str, list[FinancialFact]] = {}
         for filing in filings:
-            facts = session.query(FinancialFact).filter(
-                FinancialFact.accession_number == filing.accession_number
-            ).all()
+            facts = (
+                session.query(FinancialFact)
+                .filter(FinancialFact.accession_number == filing.accession_number)
+                .all()
+            )
             facts_by_accession[filing.accession_number] = facts
             logger.info(f"Filing {filing.accession_number}: {len(facts)} facts")
 

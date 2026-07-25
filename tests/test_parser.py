@@ -1,6 +1,8 @@
-import pytest
 from datetime import datetime
-from src.xbrl_parser import XBRLParser, FinancialFactRow
+
+import pytest
+
+from src.xbrl_parser import FinancialFactRow, XBRLParser
 
 
 class TestXBRLParser:
@@ -23,6 +25,7 @@ class TestXBRLParser:
 
     def test_extract_fact_name(self, parser):
         from lxml import etree
+
         elem = etree.Element("Revenues")
         elem.set("name", "us-gaap:Revenues")
         fact_name = parser._extract_fact_name(elem)
@@ -30,6 +33,7 @@ class TestXBRLParser:
 
     def test_extract_value_positive(self, parser):
         from lxml import etree
+
         elem = etree.Element("span")
         elem.text = "123456789"
         value = parser._extract_value(elem)
@@ -37,6 +41,7 @@ class TestXBRLParser:
 
     def test_extract_value_negative_parentheses(self, parser):
         from lxml import etree
+
         elem = etree.Element("span")
         elem.text = "(123456789)"
         value = parser._extract_value(elem)
@@ -44,6 +49,7 @@ class TestXBRLParser:
 
     def test_extract_value_with_commas(self, parser):
         from lxml import etree
+
         elem = etree.Element("span")
         elem.text = "123,456,789"
         value = parser._extract_value(elem)
@@ -51,6 +57,7 @@ class TestXBRLParser:
 
     def test_extract_value_invalid(self, parser):
         from lxml import etree
+
         elem = etree.Element("span")
         elem.text = "not a number"
         value = parser._extract_value(elem)
@@ -58,6 +65,7 @@ class TestXBRLParser:
 
     def test_extract_unit(self, parser):
         from lxml import etree
+
         elem = etree.Element("span")
         elem.set("unitRef", "USD")
         unit = parser._extract_unit(elem)
@@ -65,6 +73,7 @@ class TestXBRLParser:
 
     def test_extract_unit_with_scale(self, parser):
         from lxml import etree
+
         elem = etree.Element("span")
         elem.set("unitRef", "USD")
         elem.set("scale", "6")
@@ -73,6 +82,7 @@ class TestXBRLParser:
 
     def test_extract_periods(self, parser):
         from lxml import etree
+
         elem = etree.Element("span")
         elem.set("contextRef", "FY2023-2023-12-31")
         start_date, end_date = parser._extract_periods(elem)
@@ -80,6 +90,7 @@ class TestXBRLParser:
 
     def test_extract_segment(self, parser):
         from lxml import etree
+
         elem = etree.Element("span")
         elem.set("segmentRef", "Products_Segment")
         segment = parser._extract_segment(elem)

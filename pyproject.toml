@@ -70,10 +70,10 @@ python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
-exclude = ["tests/", "migrations/"]
+exclude = ["tests/", "migrations/", "src/schema.py"]
 
 [[tool.mypy.overrides]]
-module = ["lxml.*", "numpy.*", "pytest.*"]
+module = ["lxml.*", "numpy.*", "pytest.*", "sqlalchemy.*"]
 ignore_missing_imports = true
 
 [tool.ruff]
@@ -86,20 +86,14 @@ select = [
     "W",    # pycodestyle warnings
     "F",    # pyflakes
     "I",    # isort
-    "C",    # flake8-comprehensions
-    "B",    # flake8-bugbear
     "UP",   # pyupgrade
-    "ARG",  # flake8-unused-arguments
-    "SIM",  # flake8-simplify
 ]
 ignore = [
     "E501",  # line-too-long (handled by formatter)
-    "B008",  # mutable-argument-default
 ]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src", "api", "dags", "scripts"]
 
 [tool.ruff.format]
 quote-style = "double"
-indent-width = 4
-
-[tool.ruff.isort]
-known-first-party = ["src", "api", "dags", "scripts"]

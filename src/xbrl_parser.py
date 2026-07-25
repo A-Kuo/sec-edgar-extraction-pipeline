@@ -1,9 +1,9 @@
 import logging
 import re
-from typing import List, Dict, Any, Tuple
-from lxml import etree
 from dataclasses import dataclass
 from datetime import datetime
+
+from lxml import etree
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ class FinancialFactRow:
 
 
 class XBRLParser:
-    def parse(self, html: str, accession_number: str) -> List[FinancialFactRow]:
+    def parse(self, html: str, accession_number: str) -> list[FinancialFactRow]:
         facts = []
         try:
             root = etree.HTML(html)
@@ -45,14 +45,9 @@ class XBRLParser:
                 logger.warning(f"Failed to parse HTML for {accession_number}")
                 return facts
 
-            namespaces = {
-                'ix': 'http://www.sec.gov/cgi-bin/viewer',
-                'xbrli': 'http://www.xbrl.org/2003/instance',
-                'xbrldi': 'http://xbrl.org/2006/xbrldi',
-                'us-gaap': 'http://xbrl.us/us-gaap/2023-01-31',
-            }
-
-            elements = root.xpath('//*[contains(local-name(), "Revenues") or contains(local-name(), "NetIncome") or contains(local-name(), "Assets")]')
+            elements = root.xpath(
+                '//*[contains(local-name(), "Revenues") or contains(local-name(), "NetIncome") or contains(local-name(), "Assets")]'
+            )
 
             for elem in elements:
                 try:
@@ -68,14 +63,16 @@ class XBRLParser:
                     period_start, period_end = self._extract_periods(elem)
                     segment = self._extract_segment(elem)
 
-                    facts.append(FinancialFactRow(
-                        fact_name=fact_name,
-                        unit=unit,
-                        period_start=period_start,
-                        period_end=period_end,
-                        value=value,
-                        segment=segment or "Total"
-                    ))
+                    facts.append(
+                        FinancialFactRow(
+                            fact_name=fact_name,
+                            unit=unit,
+                            period_start=period_start,
+                            period_end=period_end,
+                            value=value,
+                            segment=segment or "Total",
+                        )
+                    )
                 except Exception as e:
                     logger.debug(f"Failed to parse element: {e}")
                     continue
@@ -88,7 +85,7 @@ class XBRLParser:
     @staticmethod
     def _extract_fact_name(elem) -> str:
         name = elem.get("name") or elem.tag
-        match = re.search(r'([A-Z][a-zA-Z]+)$', name)
+        match = re.search(r"([A-Z][a-zA-Z]+)$", name)
         return match.group(1) if match else name
 
     @staticmethod
@@ -115,12 +112,12 @@ class XBRLParser:
             try:
                 multiplier = 10 ** int(scale)
                 return f"{unit}*{multiplier}"
-            except:
+            except ValueError:
                 pass
         return unit
 
     @staticmethod
-    def _extract_periods(elem) -> Tuple[datetime, datetime]:
+    def _extract_periods(elem) -> tuple[datetime, datetime]:
         context_ref = elem.get("contextRef", "")
         start_date = None
         end_date = None
@@ -132,12 +129,12 @@ class XBRLParser:
             try:
                 start_date = datetime(*map(int, matches[0]))
                 end_date = datetime(*map(int, matches[1]))
-            except:
+            except ValueError:
                 pass
         elif len(matches) == 1:
             try:
                 end_date = datetime(*map(int, matches[0]))
-            except:
+            except ValueError:
                 pass
 
         return start_date, end_date
@@ -151,8 +148,8 @@ class XBRLParser:
 
     @staticmethod
     def apply_amendment_supersession(
-        rows: List[FinancialFactRow], latest_accession: str
-    ) -> List[FinancialFactRow]:
+        rows: list[FinancialFactRow], latest_accession: str
+    ) -> list[FinancialFactRow]:
         seen = {}
         for row in rows:
             key = (row.fact_name, row.period_end, row.segment)

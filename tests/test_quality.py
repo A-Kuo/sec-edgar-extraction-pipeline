@@ -1,5 +1,6 @@
 import pytest
-from src.quality import compute_psi, classify_psi, check_completeness, check_psi_drift, PSILevel
+
+from src.quality import PSILevel, check_completeness, check_psi_drift, classify_psi, compute_psi
 
 
 class TestPSI:

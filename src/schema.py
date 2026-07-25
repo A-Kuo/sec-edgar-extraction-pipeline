@@ -1,9 +1,8 @@
 from datetime import datetime
-from sqlalchemy import (
-    Column, String, DateTime, Float, Integer, ForeignKey, Index, Text, Enum
-)
+from enum import StrEnum
+
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import declarative_base, relationship
-import enum
 
 Base = declarative_base()
 
@@ -24,14 +23,10 @@ class FilingRaw(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     financial_facts = relationship(
-        "FinancialFact",
-        back_populates="filing",
-        cascade="all, delete-orphan"
+        "FinancialFact", back_populates="filing", cascade="all, delete-orphan"
     )
     versions = relationship(
-        "FilingVersion",
-        back_populates="original_filing",
-        cascade="all, delete-orphan"
+        "FilingVersion", back_populates="original_filing", cascade="all, delete-orphan"
     )
 
     __table_args__ = (
@@ -55,16 +50,16 @@ class FinancialFact(Base):
 
     filing = relationship("FilingRaw", back_populates="financial_facts")
 
-    __table_args__ = (
-        Index("idx_fact_name_period", "fact_name", "period_end"),
-    )
+    __table_args__ = (Index("idx_fact_name_period", "fact_name", "period_end"),)
 
 
 class FilingVersion(Base):
     __tablename__ = "filing_version"
 
     id = Column(Integer, primary_key=True)
-    original_accession = Column(String(20), ForeignKey("filing_raw.accession_number"), nullable=False)
+    original_accession = Column(
+        String(20), ForeignKey("filing_raw.accession_number"), nullable=False
+    )
     amendment_accession = Column(String(20), nullable=True)
     superseded_by = Column(String(20), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -72,7 +67,7 @@ class FilingVersion(Base):
     original_filing = relationship("FilingRaw", back_populates="versions")
 
 
-class PipelineStage(str, enum.Enum):
+class PipelineStage(StrEnum):
     FETCH = "fetch_new_filings"
     DOWNLOAD = "download_raw_documents"
     PARSE = "parse_xbrl_facts"
@@ -93,6 +88,4 @@ class PipelineAudit(Base):
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
-    __table_args__ = (
-        Index("idx_run_id_stage", "run_id", "stage"),
-    )
+    __table_args__ = (Index("idx_run_id_stage", "run_id", "stage"),)

@@ -1,10 +1,11 @@
-import time
 import logging
-from typing import Optional, Dict, Any
+import threading
+import time
+from typing import Any
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import threading
 
 logger = logging.getLogger(__name__)
 
@@ -41,14 +42,14 @@ class EdgarClient:
             total=5,
             backoff_factor=1,
             status_forcelist=[429, 503],
-            allowed_methods=["HEAD", "GET", "OPTIONS"]
+            allowed_methods=["HEAD", "GET", "OPTIONS"],
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
         self.session.headers.update({"User-Agent": user_agent})
 
-    def _request(self, method: str, url: str, **kwargs) -> Optional[requests.Response]:
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response | None:
         self.bucket.acquire()
         try:
             response = self.session.request(method, url, **kwargs)
@@ -62,7 +63,7 @@ class EdgarClient:
             logger.error(f"Request failed: {e}")
             return None
 
-    def get_company_filings(self, cik: str, form_type: str = "10-K") -> Optional[Dict[str, Any]]:
+    def get_company_filings(self, cik: str, form_type: str = "10-K") -> dict[str, Any] | None:
         url = f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json"
         response = self._request("GET", url)
         if response:
@@ -72,15 +73,14 @@ class EdgarClient:
                 logger.error(f"Failed to parse JSON: {e}")
         return None
 
-    def get_xbrl_facts(self, accession_number: str) -> Optional[Dict[str, Any]]:
-        accession_path = accession_number.replace("-", "")
+    def get_xbrl_facts(self, accession_number: str) -> dict[str, Any] | None:
         url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={accession_number}&type=10-K&dateb=&owner=exclude&count=100&search_text="
         response = self._request("GET", url)
         if response:
             return {"accession": accession_number, "html": response.text}
         return None
 
-    def get_filing_index(self, cik: str, form_type: str = "10-K") -> Optional[Dict[str, Any]]:
+    def get_filing_index(self, cik: str, form_type: str = "10-K") -> dict[str, Any] | None:
         url = f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json"
         response = self._request("GET", url)
         if response:
@@ -90,15 +90,14 @@ class EdgarClient:
                 logger.error(f"Failed to parse JSON: {e}")
         return None
 
-    def get_filing_document(self, accession_number: str) -> Optional[str]:
-        accession_path = accession_number.replace("-", "")
+    def get_filing_document(self, accession_number: str) -> str | None:
         url = f"https://www.sec.gov/cgi-bin/viewer?action=view&cik={accession_number}&accession_number={accession_number}&xbrl_type=v"
         response = self._request("GET", url)
         if response:
             return response.text
         return None
 
-    def search_filings(self, query: str) -> Optional[Dict[str, Any]]:
+    def search_filings(self, query: str) -> dict[str, Any] | None:
         url = f"https://www.sec.gov/cgi-bin/browse-edgar?company={query}&action=getcompany"
         response = self._request("GET", url)
         if response:

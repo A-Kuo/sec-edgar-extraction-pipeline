@@ -1,13 +1,14 @@
 import logging
-from typing import List, Dict, Any
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
+from typing import Any
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 
-class PSILevel(str, Enum):
+class PSILevel(StrEnum):
     CLEAN = "clean"
     WARN = "warning"
     ALERT = "alert"
@@ -29,7 +30,7 @@ class QualityResult:
     total_expected: int
 
 
-def compute_psi(baseline: List[float], current: List[float], bins: int = 10) -> float:
+def compute_psi(baseline: list[float], current: list[float], bins: int = 10) -> float:
     """Compute Population Stability Index."""
     if not baseline or not current:
         return 0.0
@@ -69,7 +70,7 @@ def classify_psi(psi: float) -> PSILevel:
 
 
 def check_completeness(
-    run_id: str, facts_by_accession: Dict[str, List[Any]], threshold: float = 0.95
+    run_id: str, facts_by_accession: dict[str, list[Any]], threshold: float = 0.95
 ) -> QualityResult:
     """Check completeness of facts across filings."""
     total_filings = len(facts_by_accession)
@@ -85,21 +86,17 @@ def check_completeness(
 
     completeness = len(all_facts) / (total_filings * 8)
     if completeness < threshold:
-        raise ValueError(
-            f"Completeness {completeness:.2%} below threshold {threshold:.2%}"
-        )
+        raise ValueError(f"Completeness {completeness:.2%} below threshold {threshold:.2%}")
 
     return QualityResult(
         completeness_pct=completeness,
         status="PASS",
         missing_count=int((1 - completeness) * total_filings * 8),
-        total_expected=total_filings * 8
+        total_expected=total_filings * 8,
     )
 
 
-def check_psi_drift(
-    fact_name: str, baseline: List[float], current: List[float]
-) -> PSIResult:
+def check_psi_drift(fact_name: str, baseline: list[float], current: list[float]) -> PSIResult:
     """Check for PSI drift in a fact."""
     psi = compute_psi(baseline, current)
     level = classify_psi(psi)
@@ -107,9 +104,4 @@ def check_psi_drift(
     message = f"PSI for {fact_name}: {psi:.4f} ({level.value})"
     logger.info(message)
 
-    return PSIResult(
-        fact_name=fact_name,
-        psi_value=psi,
-        level=level,
-        message=message
-    )
+    return PSIResult(fact_name=fact_name, psi_value=psi, level=level, message=message)

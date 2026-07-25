@@ -1,10 +1,10 @@
-from datetime import datetime, timedelta
-import os
 import logging
+import os
+from datetime import datetime, timedelta
+
 from airflow import DAG
+from airflow.exceptions import AirflowSkipException
 from airflow.operators.python import PythonOperator
-from airflow.exceptions import AirflowSkipException, AirflowFailException
-from airflow.models import Variable
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ def validate_quality_gates(**context):
     logger.info(f"Validating quality gates for run {run_id}")
 
     if facts.get("facts_count", 0) == 0:
-        logger.info(f"No facts found, skipping quality validation")
+        logger.info("No facts found, skipping quality validation")
         raise AirflowSkipException("No filings to process")
 
     # In production, run check_completeness and check_psi_drift
@@ -56,7 +56,6 @@ def validate_quality_gates(**context):
 def load_to_warehouse(**context):
     """Load facts into PostgreSQL warehouse."""
     run_id = context["run_id"]
-    quality = context["task_instance"].xcom_pull(task_ids="validate_quality_gates")
     logger.info(f"Loading facts to warehouse for run {run_id}")
     if os.getenv("MOCK_EDGAR"):
         return {"rows_loaded": 40}
