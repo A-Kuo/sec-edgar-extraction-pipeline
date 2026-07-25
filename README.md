@@ -3,6 +3,9 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Docker Ready](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
+[![Tests](https://github.com/a-kuo/sec-edgar-extraction-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/a-kuo/sec-edgar-extraction-pipeline/actions/workflows/ci.yml)
+[![Code style: ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Type checked: mypy](https://img.shields.io/badge/type%20checked-mypy-green.svg)](https://www.mypy-lang.org/)
 
 > Production-grade data engineering pipeline for ingesting SEC 10-K/10-Q filings into PostgreSQL with Airflow orchestration, XBRL parsing, Redis caching, and PSI drift monitoring.
 
@@ -294,19 +297,13 @@ Each task logs to `pipeline_audit` table (append-only, never UPDATE/DELETE).
 
 ```bash
 # Run all tests (47 passing)
-pytest tests/ -v
+make test                    # Full test suite with coverage
 
 # Run specific test suite
-pytest tests/test_api.py -v          # 14 tests: all endpoints + cache
-pytest tests/test_client.py -v       # 8 tests: rate limiting, retry
-pytest tests/test_parser.py -v       # 18 tests: XBRL parsing
-pytest tests/test_quality.py -v      # 9 tests: PSI + completeness
-
-# With coverage report
-pytest --cov=src --cov=api tests/
-
-# Watch mode (auto-rerun on file change)
-pytest-watch tests/
+pytest tests/test_api.py -v  # 14 tests: all endpoints + cache
+pytest tests/test_client.py -v  # 8 tests: rate limiting, retry
+pytest tests/test_parser.py -v  # 18 tests: XBRL parsing
+pytest tests/test_quality.py -v # 9 tests: PSI + completeness
 ```
 
 **Environment for tests:**
@@ -314,6 +311,24 @@ pytest-watch tests/
 - Creates in-memory SQLite database (no PostgreSQL needed)
 - Mocks Redis client
 - Fixtures provide sample XBRL HTML and filings
+
+## Development
+
+**Quick start:**
+```bash
+make install-dev   # Install dev dependencies
+make pre-commit    # Install pre-commit hooks
+make test          # Run tests
+make quality       # Lint + type-check
+```
+
+**Code quality:**
+- Auto-formatted with `ruff format`
+- Linted with `ruff check`
+- Type-checked with `mypy`
+- Pre-commit hooks catch issues before commit
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed contribution guidelines and [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for architecture details.
 
 ## Environment Variables
 

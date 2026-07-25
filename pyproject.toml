@@ -1,0 +1,105 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sec-edgar-extraction-pipeline"
+version = "1.0.0"
+description = "Production-grade data engineering pipeline for SEC EDGAR financial data extraction"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "A. Kuo", email = "aus.kuo03@gmail.com"},
+]
+requires-python = ">=3.11"
+dependencies = [
+    "sqlalchemy>=2.0.0",
+    "psycopg2-binary>=2.9.0",
+    "fastapi>=0.109.0",
+    "uvicorn>=0.27.0",
+    "redis>=5.0.0",
+    "requests>=2.31.0",
+    "pydantic>=2.5.0",
+    "lxml>=4.9.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-mock>=3.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-asyncio>=0.21.0",
+    "httpx>=0.24.0",
+    "ruff>=0.1.0",
+    "mypy>=1.7.0",
+    "pre-commit>=3.0.0",
+]
+airflow = [
+    "apache-airflow>=2.8.0",
+    "apache-airflow-providers-slack>=7.1.0",
+]
+migrations = [
+    "alembic>=1.13.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v --tb=short"
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["src", "api"]
+omit = ["*/tests/*", "*/conftest.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+exclude = ["tests/", "migrations/"]
+
+[[tool.mypy.overrides]]
+module = ["lxml.*", "numpy.*", "pytest.*"]
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "C",    # flake8-comprehensions
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "ARG",  # flake8-unused-arguments
+    "SIM",  # flake8-simplify
+]
+ignore = [
+    "E501",  # line-too-long (handled by formatter)
+    "B008",  # mutable-argument-default
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-width = 4
+
+[tool.ruff.isort]
+known-first-party = ["src", "api", "dags", "scripts"]

@@ -1,3 +1,4 @@
+# Production dependencies
 sqlalchemy>=2.0.0,<3.0.0
 psycopg2-binary>=2.9.0
 alembic>=1.13.0
@@ -8,6 +9,12 @@ requests>=2.31.0
 pydantic>=2.5.0
 lxml>=4.9.0
 numpy>=1.24.0
+
+# Development dependencies
 pytest>=7.0.0
 pytest-mock>=3.0.0
+pytest-cov>=4.0.0
 httpx>=0.24.0
+ruff>=0.1.0
+mypy>=1.7.0
+pre-commit>=3.0.0
