@@ -1,295 +1,218 @@
 # SEC EDGAR Extraction Pipeline
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Docker Ready](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
 
-> Production-grade LLM fine-tuning pipeline for structured data extraction from SEC filings (10-K, 10-Q). Delivers 150x cost reduction over GPT-4 with 94% field accuracy and 320ms p50 latency.
+> A data engineering pipeline that ingests SEC 10-K/10-Q filings, extracts structured financial facts from XBRL, validates data quality, and serves the results through a caching API.
 
-## Overview
+## Problem
 
-This project demonstrates a complete MLOps pipeline for fine-tuning and serving domain-specific LLMs. It transforms raw SEC EDGAR filings into structured financial data using a fine-tuned Llama 3.1 8B model, with comprehensive monitoring, caching, and cost optimization.
+SEC filings are published as unstructured HTML/XBRL documents. Pulling a single metric — revenue, net income, total assets — for a set of companies over time means manually locating filings, parsing inconsistent markup, and reconciling amendments. This doesn't scale past a handful of one-off lookups.
 
-### Key Results
+## Solution
 
-| Metric | Value | Comparison |
-|--------|-------|------------|
-| Cost per extraction | $0.0002 | 150x cheaper than GPT-4 ($0.03) |
-| Field accuracy | 94% | Comparable to GPT-4 (96%) |
-| p50 latency | 320ms | With Redis caching |
-| p99 latency | <1s | vLLM batching optimization |
-| Capability retention | 98% | On MMLU/GSM8K post-fine-tuning |
+This pipeline automates the full path from raw filing to queryable, versioned financial data:
+
+1. **Ingest** — an SEC EDGAR API client (rate-limited, retrying) pulls filing metadata and raw documents by CIK/ticker.
+2. **Parse** — an XBRL parser extracts a fixed set of financial facts (revenue, net income, assets, liabilities, EPS, etc.), normalizing units and period types.
+3. **Validate** — a quality layer checks field completeness against a threshold and flags statistical drift (PSI) in extracted values before anything is trusted downstream.
+4. **Store** — validated facts land in PostgreSQL with an append-only audit trail and amendment-aware version history.
+5. **Serve** — a FastAPI layer exposes filings and time-series facts, backed by a Redis cache.
+
+The pipeline is orchestrated end-to-end by an Airflow DAG and runs entirely deterministically — no LLM is involved in extraction.
 
 ## Architecture
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌─────────────┐
-│ SEC EDGAR   │────▶│  Airflow DAG │────▶│  QLoRA      │────▶│  vLLM       │
-│ Filings     │     │  Orchestrator│     │  Inference  │     │  Server     │
-└─────────────┘     └──────────────┘     └─────────────┘     └─────────────┘
-                                                                  │
-                              ┌─────────────┐    ┌─────────────┐│
-                              │  PostgreSQL │◄───│  Redis LRU  │◄┘
-                              │  Audit Trail│    │  Cache      │
-                              └─────────────┘    └─────────────┘
+SEC EDGAR API
+     │
+     ▼
+┌───────────────────────────────────────────┐
+│  Airflow DAG (7 tasks)                    │
+├───────────────────────────────────────────┤
+│ 1. fetch_new_filings      (EdgarClient)   │
+│ 2. download_raw_documents                 │
+│ 3. parse_xbrl_facts        (XBRLParser)   │
+│ 4. validate_quality_gates  (PSI + complete)│
+│ 5. load_to_warehouse       (PostgreSQL)   │
+│ 6. update_audit_trail      (append-only)  │
+│ 7. send_alerts_on_failure  (Slack/SMTP)   │
+└───────────────────────────────────────────┘
+     │
+     ▼
+┌────────────────────────┐    ┌────────────────────────┐
+│  PostgreSQL             │    │  Redis Cache            │
+│  filings_raw, facts,    │◄───┤  CIK (1h), filing index │
+│  versions, audit trail  │    │  (24h), facts (7d)      │
+└────────────────────────┘    └────────────────────────┘
+     │
+     ▼
+┌────────────────────────────────────────┐
+│  FastAPI serving layer                  │
+│  health / filings / filing / facts /    │
+│  trigger                                 │
+└────────────────────────────────────────┘
 ```
-
-### Technology Stack
-
-- **Fine-tuning**: QLoRA (4-bit quantization), PEFT, Transformers
-- **Serving**: vLLM (PagedAttention, continuous batching)
-- **API**: FastAPI with async endpoints
-- **Cache**: Redis (LRU eviction, TTL-based expiration)
-- **Database**: PostgreSQL (audit trails, extraction history)
-- **Orchestration**: Apache Airflow
-- **Monitoring**: Weights & Biases, Prometheus metrics
-- **Infrastructure**: Docker, Docker Compose, GitHub Actions
 
 ## Repository Structure
 
 ```
 sec-edgar-extraction-pipeline/
 ├── src/
-│   ├── finetune/
-│   │   ├── qlora_training.py          # QLoRA fine-tuning with 4-bit quantization
-│   │   ├── data_loading.py              # SEC filing format handling
-│   │   └── eval_benchmarks.py           # MMLU, GSM8K catastrophic forgetting tests
-│   ├── serve/
-│   │   ├── vllm_server.py               # vLLM inference with dynamic batching
-│   │   ├── api.py                       # FastAPI endpoints for extraction
-│   │   └── cache.py                     # Redis caching strategy (LRU, TTL)
-│   └── pipeline/
-│       ├── airflow_dag.py               # Pipeline orchestration
-│       ├── db_schema.sql                # PostgreSQL audit trail schema
-│       └── monitoring.py                # Drift detection, metrics logging
-├── notebooks/
-│   ├── 01_qlora_finetuning.ipynb        # Step-by-step fine-tuning walkthrough
-│   ├── 02_model_evaluation.ipynb        # Catastrophic forgetting analysis
-│   └── 03_inference_optimization.ipynb  # Latency profiling and optimization
-├── docker/
-│   ├── Dockerfile                       # vLLM serving container
-│   ├── docker-compose.yml               # Full stack deployment
-│   └── requirements.txt
-├── tests/
-│   ├── test_extraction_accuracy.py      # Field-level accuracy tests
-│   ├── test_latency_bounds.py           # p50 < 320ms, p99 < 1s
-│   └── test_cache_hit_rate.py           # Cache performance validation
-├── README.md                            # This file
-├── ARCHITECTURE.md                      # Detailed system design
-└── COST_ANALYSIS.md                     # Cost comparison spreadsheet
+│   ├── schema.py           # SQLAlchemy ORM models (4 tables)
+│   ├── edgar_client.py     # EDGAR API client (rate-limited, retry with backoff)
+│   ├── xbrl_parser.py      # XBRL HTML -> financial fact extraction
+│   ├── quality.py          # Completeness checks + PSI drift detection
+│   ├── cache.py            # Redis caching (CIK, filing index, facts)
+│   └── alerts.py           # Slack/SMTP alerting on pipeline failure
+├── api/
+│   └── main.py              # FastAPI serving layer
+├── dags/
+│   └── edgar_pipeline.py    # Airflow DAG (7-task pipeline)
+├── scripts/
+│   ├── backfill.py          # CLI: historical ingestion by CIK + date range
+│   └── validate.py          # CLI: run quality checks for a given run_id
+├── migrations/               # Alembic migration environment + versions
+├── tests/                    # pytest suite (client, parser, quality, DAG, API)
+├── docker-compose.yml        # PostgreSQL 16 + Redis 7
+├── requirements.txt
+├── alembic.ini
+├── AGENTS.md                  # Architecture spec + build notes for contributors/agents
+└── README.md
 ```
 
-## Quick Start
+## Setup
 
 ### Prerequisites
 
-- Python 3.10+
-- CUDA-capable GPU (for inference) or CPU with sufficient RAM
-- Docker and Docker Compose (for full stack deployment)
+- Python 3.11+
+- PostgreSQL 16 and Redis 7 (via Docker Compose, or run natively)
 
 ### Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/sec-edgar-extraction-pipeline.git
+git clone https://github.com/A-Kuo/sec-edgar-extraction-pipeline.git
 cd sec-edgar-extraction-pipeline
 
-# Install dependencies
 pip install -r requirements.txt
 
-# Set up environment variables
-cp .env.example .env
-# Edit .env with your credentials
+export DATABASE_URL=postgresql://sec_user:sec_pass@localhost/sec_edgar
+export REDIS_URL=redis://localhost:6379/0
+export SEC_USER_AGENT="your-app-name your.email@example.com"  # required by SEC; omitting it returns 403
+export MOCK_EDGAR=true   # skip live API calls during local development/tests
 ```
 
-### Docker Deployment (Recommended)
+### Quick Start
 
 ```bash
-# Start the full stack
+# Start PostgreSQL + Redis
 docker-compose up -d
 
-# Verify services are running
-curl http://localhost:8000/health
+# Apply schema migrations
+alembic upgrade head
 
-# Access API documentation
-curl http://localhost:8000/docs
-```
+# Run the test suite
+pytest tests/ -v
 
-### Local Development
-
-```bash
-# Start Redis and PostgreSQL
-docker-compose up -d redis postgres
-
-# Run the FastAPI server
-uvicorn src.serve.api:app --reload --port 8000
-
-# Run a test extraction
-curl -X POST http://localhost:8000/extract \
-  -H "Content-Type: application/json" \
-  -d '{"filing_url": "https://www.sec.gov/Archives/...", "fields": ["revenue", "net_income"]}'
+# Start the API
+uvicorn api.main:app --reload --port 8000
+# Interactive docs at http://localhost:8000/docs
 ```
 
 ## Usage
 
-### Single Filing Extraction
+### API
 
-```python
-import requests
-
-response = requests.post(
-    "http://localhost:8000/extract",
-    json={
-        "filing_url": "https://www.sec.gov/Archives/edgar/data/.../10-K.txt",
-        "fields": ["total_revenue", "net_income", "total_assets"],
-        "format": "structured_json"
-    }
-)
-
-result = response.json()
-print(result["extracted_fields"])
-```
-
-### Batch Processing
-
-```python
-# Submit batch job
-response = requests.post(
-    "http://localhost:8000/extract/batch",
-    json={
-        "filings": [
-            {"url": "...", "cik": "0000320193", "form": "10-K"},
-            {"url": "...", "cik": "0000789019", "form": "10-Q"}
-        ],
-        "fields": ["revenue", "net_income", "eps"]
-    }
-)
-
-# Check job status
-job_id = response.json()["job_id"]
-status = requests.get(f"http://localhost:8000/jobs/{job_id}").json()
-```
-
-## Fine-tuning
-
-### Training Your Own Model
+All read endpoints check Redis before hitting PostgreSQL.
 
 ```bash
-# Prepare training data
-python src/finetune/data_loading.py \
-    --input data/sec_filings_raw/ \
-    --output data/training/ \
-    --format alpaca
+curl http://localhost:8000/health
 
-# Run QLoRA fine-tuning
-python src/finetune/qlora_training.py \
-    --model meta-llama/Llama-3.1-8B \
-    --dataset data/training/sec_extractions.json \
-    --output models/sec-extractor-qlora \
-    --epochs 3 \
-    --batch-size 4 \
-    --learning-rate 2e-4
+curl http://localhost:8000/filings/AAPL?limit=10&offset=0
 
-# Evaluate on benchmarks
-python src/finetune/eval_benchmarks.py \
-    --model models/sec-extractor-qlora \
-    --benchmarks mmlu,gsm8k
+curl http://localhost:8000/filing/0000320193-23-000077
+
+curl http://localhost:8000/facts/AAPL/Revenues
+
+curl -X POST http://localhost:8000/trigger/AAPL
 ```
 
-See [notebooks/01_qlora_finetuning.ipynb](notebooks/01_qlora_finetuning.ipynb) for a detailed walkthrough.
+### Backfill historical data
 
-## Evaluation
+```bash
+python scripts/backfill.py \
+  --cik 0000320193 \
+  --start-date 2020-01-01 \
+  --end-date 2024-01-01
+```
 
-### Catastrophic Forgetting Analysis
+### Run quality checks against a pipeline run
 
-We evaluate post-fine-tuning model performance on general knowledge benchmarks to ensure domain adaptation doesn't degrade general capabilities:
+```bash
+python scripts/validate.py --run-id backfill-0000320193-2024-01-01
+```
 
-| Benchmark | Pre-Fine-Tune | Post-Fine-Tune | Delta |
-|-----------|--------------|----------------|-------|
-| MMLU | 63.4% | 62.1% | -1.3% |
-| GSM8K | 46.4% | 45.9% | -0.5% |
-| HumanEval | 32.3% | 31.8% | -0.5% |
+### Airflow DAG
 
-**Result**: 98% capability retention demonstrates effective domain adaptation without catastrophic forgetting.
+```bash
+export AIRFLOW_HOME=$(pwd)/airflow
+airflow db init
+airflow dags unpause edgar_pipeline
+airflow dags test edgar_pipeline 2024-01-15
+```
 
-### Extraction Accuracy
-
-Tested on 500 held-out SEC filings:
-
-| Field Type | Accuracy | Precision | Recall | F1 |
-|------------|----------|-----------|--------|-----|
-| Financial values | 96% | 97% | 95% | 96% |
-| Dates (fiscal year) | 98% | 99% | 97% | 98% |
-| Text (CEO statements) | 88% | 89% | 87% | 88% |
-| **Overall** | **94%** | **95%** | **93%** | **94%** |
-
-## Cost Analysis
-
-| Component | GPT-4 API | Fine-tuned Llama | Savings |
-|-----------|-----------|------------------|---------|
-| Per extraction | $0.03 | $0.0002 | 150x |
-| 1M extractions | $30,000 | $200 | 99.3% |
-| Infrastructure | $0 (managed) | ~$500/mo GPU | - |
-| **Break-even** | - | ~17K extractions | - |
-
-Full cost breakdown in [COST_ANALYSIS.md](COST_ANALYSIS.md).
+Every task writes a start/end row to `pipeline_audit`, which is append-only — no `UPDATE`/`DELETE` is ever issued against it.
 
 ## Testing
 
 ```bash
-# Run all tests
-pytest tests/ -v
-
-# Run specific test suite
-pytest tests/test_extraction_accuracy.py -v
-pytest tests/test_latency_bounds.py -v
-pytest tests/test_cache_hit_rate.py -v
-
-# With coverage report
-pytest --cov=src tests/
+pytest tests/ -v                     # full suite
+pytest tests/test_api.py -v          # endpoints + caching behavior
+pytest tests/test_client.py -v       # rate limiting, retry/backoff
+pytest tests/test_parser.py -v       # XBRL extraction, units, periods
+pytest tests/test_quality.py -v      # completeness + PSI edge cases
+pytest tests/test_dag.py -v          # DAG structure and task wiring
+pytest --cov=src --cov=api tests/    # with coverage
 ```
 
-## Mathematical Foundations
+Tests run against an in-memory SQLite database and a mocked Redis client, with `MOCK_EDGAR=true` substituting fixture responses for live SEC API calls — no external services are required to run the suite.
 
-This project applies core ML mathematics:
+## Environment Variables
 
-- **Linear Algebra**: QLoRA uses low-rank matrix decomposition (r=16) to reduce trainable parameters by 99.9% while preserving full-rank forward passes
-- **Calculus**: AdamW optimizer with cosine scheduling for gradient descent on LoRA adapter weights
-- **Information Theory**: Entropy-based confidence scoring for extraction quality
-- **Statistics**: Confidence intervals for accuracy metrics, McNemar's test for model comparison
+| Variable | Default | Purpose |
+|---|---|---|
+| `DATABASE_URL` | `postgresql://sec_user:sec_pass@localhost/sec_edgar` | PostgreSQL connection string |
+| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection string |
+| `SEC_USER_AGENT` | none | Required by SEC EDGAR; requests without it return 403 |
+| `MOCK_EDGAR` | `false` | Set `true` for local dev/tests to use fixture data instead of live calls |
+| `SLACK_WEBHOOK_URL` | unset | Optional Slack alerting on pipeline failure |
+| `SMTP_HOST`, `ALERT_EMAIL_TO` | unset | Optional email alerting on pipeline failure |
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed mathematical explanations.
+## Key Design Decisions
+
+- **No LLM in the extraction path.** XBRL parsing is deterministic (`lxml`), so extraction is reproducible and carries no hallucination risk.
+- **Append-only audit trail.** `pipeline_audit` is never updated or deleted from — it's a permanent record of every pipeline run.
+- **Cache-first API.** Every read endpoint checks Redis first and falls back to PostgreSQL, with graceful degradation if Redis is unavailable.
+- **Rate-limited ingestion.** A token-bucket limiter keeps requests to SEC EDGAR at or below 10 req/s, per their access guidelines.
+- **Drift-aware quality gates.** PSI (Population Stability Index) on extracted fact distributions flags data quality regressions before they reach the warehouse, not after.
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit changes (`git commit -m 'Add amazing feature'`)
-4. Push to branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+See [AGENTS.md](AGENTS.md) for the full architecture spec, schema definitions, and implementation notes.
 
-All PRs must pass:
-- Unit tests (`pytest`)
-- Type checking (`mypy`)
-- Linting (`ruff check .`)
-- Coverage threshold (80%)
+1. Create a feature branch: `git checkout -b feature/your-feature`
+2. Make changes and verify: `pytest tests/ -v`
+3. Commit with a descriptive message and open a pull request
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- QLoRA paper: [Dettmers et al., 2023](https://arxiv.org/abs/2305.14314)
-- vLLM: [Kwon et al., 2023](https://arxiv.org/abs/2309.06180)
-- SEC EDGAR for providing public financial data
+MIT License — see [LICENSE](LICENSE).
 
 ## Contact
 
-For questions or collaboration:
-- GitHub Issues: [github.com/yourusername/sec-edgar-extraction-pipeline/issues](https://github.com/yourusername/sec-edgar-extraction-pipeline/issues)
-- Email: your.email@example.com
+Issues and questions: [GitHub Issues](https://github.com/A-Kuo/sec-edgar-extraction-pipeline/issues)
 
 ---
 
-**Status**: Production-ready | **Last Updated**: May 2026 | **Version**: 1.0.0
+**Status:** Core pipeline complete (ingestion, parsing, quality, caching, API, DAG, tests) | **Last updated:** August 2026
