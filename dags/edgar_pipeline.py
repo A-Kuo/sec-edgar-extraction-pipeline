@@ -487,7 +487,7 @@ def _build_drift_report(detector: Any, matrix: Any, metadata: Any) -> Any:
 
 def load_to_warehouse(**context: Any) -> int:
     """
-    Stage 5 — Bulk-insert parsed facts into the PostgreSQL warehouse.
+    Stage 6 — Idempotently upsert parsed facts into the PostgreSQL warehouse.
 
     Returns the number of rows inserted.
     """
@@ -512,7 +512,7 @@ def load_to_warehouse(**context: Any) -> int:
 
 def update_audit_trail(**context: Any) -> None:
     """
-    Stage 6 — Mark the DAG run as fully complete in the audit trail.
+    Stage 7 — Mark the DAG run as fully complete in the audit trail.
     """
     run_id: str = context["run_id"]
     _audit_start(run_id, "load")
@@ -532,7 +532,7 @@ def update_audit_trail(**context: Any) -> None:
 
 def send_alerts_on_failure(**context: Any) -> None:
     """
-    Stage 7 — Send failure alerts.  Only executes when an upstream task fails
+    Stage 8 — Send failure alerts.  Only executes when an upstream task fails
     (trigger_rule=ONE_FAILED).
     """
     run_id: str = context["run_id"]
@@ -561,28 +561,35 @@ def send_alerts_on_failure(**context: Any) -> None:
 
 
 def _persist_raw_filing(filing: dict, html: str, run_id: str) -> None:
+    """
+    Land one raw filing idempotently.
+
+    A check-then-insert here (``session.get()`` then conditional ``add()``)
+    is not atomic: two workers racing on the same accession, or a retry
+    landing between the check and the insert, can both decide "not present"
+    and then one of them fails on the primary-key violation instead of
+    quietly no-opping. ``upsert_filing_raw`` does the check and the write as
+    one atomic ``INSERT ... ON CONFLICT DO NOTHING`` statement.
+    """
     from sqlalchemy import create_engine
     from sqlalchemy.orm import Session
 
-    from src.schema import FilingRaw
+    from src.upsert import upsert_filing_raw
 
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
     with Session(engine) as session:
-        existing = session.get(FilingRaw, filing["accession_number"])
-        if existing is None:
-            session.add(
-                FilingRaw(
-                    accession_number=filing["accession_number"],
-                    cik=filing["cik"],
-                    ticker=filing.get("ticker"),
-                    filing_type=filing["filing_type"],
-                    filing_date=filing["filing_date"],
-                    period_of_report=filing.get("period_of_report"),
-                    raw_html=html,
-                    pipeline_run_id=run_id,
-                )
-            )
-            session.commit()
+        upsert_filing_raw(
+            session,
+            accession_number=filing["accession_number"],
+            cik=filing["cik"],
+            ticker=filing.get("ticker"),
+            filing_type=filing["filing_type"],
+            filing_date=filing["filing_date"],
+            period_of_report=filing.get("period_of_report"),
+            raw_html=html,
+            pipeline_run_id=run_id,
+        )
+        session.commit()
 
 
 def _load_raw_html(accessions: list[str]) -> dict[str, str]:
@@ -633,30 +640,25 @@ def _persist_anomaly_scores(
     drift: Any,
 ) -> None:
     """
-    Write one ``model_runs`` row and its ``fact_anomalies`` children.
+    Idempotently write one ``model_runs`` row and its ``fact_anomalies`` children.
 
-    Scoring is re-runnable: a retried task deletes this run's prior scores
-    before inserting, so an Airflow retry replaces rather than duplicates.
-    Only ``fact_anomalies`` is rewritten — ``pipeline_audit`` stays append-only.
+    Previously a retried task deleted the prior attempt's ``ModelRun`` row and
+    its children, then inserted fresh ones — functionally idempotent, but
+    every retry churned the row's ``id`` and briefly left the run with zero
+    anomaly rows between the delete and the re-insert. ``upsert_model_run``
+    keyed on ``(run_id, model_version)`` and ``upsert_fact_anomalies`` keyed
+    on ``(model_run_id, accession_number)`` update the same rows in place
+    instead — one atomic statement per table, no window with missing data.
     """
-    from sqlalchemy import create_engine, delete
+    from sqlalchemy import create_engine
     from sqlalchemy.orm import Session
 
-    from src.schema import FactAnomaly, ModelRun
+    from src.upsert import upsert_fact_anomalies, upsert_model_run
 
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
     with Session(engine) as session:
-        existing = (
-            session.query(ModelRun)
-            .filter(ModelRun.run_id == run_id, ModelRun.model_version == metadata.version)
-            .one_or_none()
-        )
-        if existing is not None:
-            session.execute(delete(FactAnomaly).where(FactAnomaly.model_run_id == existing.id))
-            session.delete(existing)
-            session.flush()
-
-        model_run = ModelRun(
+        model_run_id = upsert_model_run(
+            session,
             run_id=run_id,
             model_version=metadata.version,
             model_sha256=metadata.artifact_sha256,
@@ -667,24 +669,7 @@ def _persist_anomaly_scores(
             drift_report=drift.as_dict() if drift else None,
             drift_level=drift.worst_level.value if drift else None,
         )
-        session.add(model_run)
-        session.flush()  # assign model_run.id
-
-        session.add_all(
-            FactAnomaly(
-                model_run_id=model_run.id,
-                accession_number=s.accession_number,
-                score=s.score,
-                model_score=s.model_score,
-                rule_score=s.rule_score,
-                is_anomaly=s.is_anomaly,
-                triggered_by=s.triggered_by,
-                reason=s.explain(),
-                rule_violations=[v.as_dict() for v in s.rule_violations],
-                top_contributors=[[n, z] for n, z in s.top_contributors],
-            )
-            for s in scores
-        )
+        upsert_fact_anomalies(session, model_run_id, scores)
         session.commit()
 
     logger.info(
@@ -696,17 +681,28 @@ def _persist_anomaly_scores(
 
 
 def _bulk_insert_facts(facts: list[dict]) -> int:
+    """
+    Idempotently write parsed facts to the warehouse.
+
+    Previously ``session.bulk_save_objects(objects)`` — a blind bulk INSERT
+    with no conflict handling, against a table with no natural-key
+    constraint. An Airflow retry after a worker died mid-batch (the DAG's
+    ``default_args`` set ``retries=2``) would re-run this task against the
+    same XCom'd fact list and duplicate every row already committed.
+    ``upsert_financial_facts`` keys each row on ``fact_hash`` — a SHA-256 of
+    the fact's natural key — so a retried batch converges to one row per
+    fact instead.
+    """
     from sqlalchemy import create_engine
     from sqlalchemy.orm import Session
 
-    from src.schema import FinancialFact
+    from src.upsert import upsert_financial_facts
 
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
     with Session(engine) as session:
-        objects = [FinancialFact(**f) for f in facts]
-        session.bulk_save_objects(objects)
+        count = upsert_financial_facts(session, facts)
         session.commit()
-    return len(objects)
+    return count
 
 
 # ---------------------------------------------------------------------------

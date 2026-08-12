@@ -61,7 +61,9 @@ class TestFilingRawAndFacts:
             filing_type="10-K",
             filing_date=date(2024, 1, 1),
         )
-        filing.facts.append(FinancialFact(fact_name="us-gaap:Revenues", fact_value=100))
+        filing.facts.append(
+            FinancialFact(fact_name="us-gaap:Revenues", fact_value=100, fact_hash="h" * 64)
+        )
         session.add(filing)
         session.commit()
 
@@ -80,6 +82,40 @@ class TestFilingRawAndFacts:
             accession_number="A1", cik="1", filing_type="10-K", filing_date=date(2024, 1, 1)
         )
         assert "A1" in repr(filing)
+
+    def test_fact_hash_uniqueness_is_enforced_at_the_db_level(self, session):
+        """
+        Pins the constraint src.upsert.upsert_financial_facts relies on as
+        its ON CONFLICT target. If this constraint were ever dropped from the
+        model, the UPSERT would silently degrade back to a blind INSERT.
+        """
+        filing = FilingRaw(
+            accession_number="A1", cik="1", filing_type="10-K", filing_date=date(2024, 1, 1)
+        )
+        session.add(filing)
+        session.add(
+            FinancialFact(accession_number="A1", fact_name="us-gaap:Assets", fact_hash="h" * 64)
+        )
+        session.commit()
+
+        session.add(
+            FinancialFact(
+                accession_number="A1", fact_name="us-gaap:Liabilities", fact_hash="h" * 64
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+    def test_fact_hash_is_required(self, session):
+        filing = FilingRaw(
+            accession_number="A1", cik="1", filing_type="10-K", filing_date=date(2024, 1, 1)
+        )
+        session.add(filing)
+        session.add(FinancialFact(accession_number="A1", fact_name="us-gaap:Assets"))
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
 
 
 class TestFilingVersion:
@@ -189,6 +225,34 @@ class TestModelRunAndFactAnomaly:
         with pytest.raises(IntegrityError):
             session.commit()
         session.rollback()
+
+    def test_unique_constraint_on_run_id_and_model_version(self, session):
+        """
+        Pins the constraint src.upsert.upsert_model_run relies on as its ON
+        CONFLICT target — without it, a retried scoring task would insert a
+        second model_runs row instead of updating the first.
+        """
+        session.add(
+            ModelRun(run_id="run-1", model_version="v1", model_sha256="a" * 64, threshold=0.6)
+        )
+        session.commit()
+
+        session.add(
+            ModelRun(run_id="run-1", model_version="v1", model_sha256="b" * 64, threshold=0.7)
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+    def test_same_run_id_different_model_version_is_allowed(self, session):
+        session.add(
+            ModelRun(run_id="run-1", model_version="v1", model_sha256="a" * 64, threshold=0.6)
+        )
+        session.add(
+            ModelRun(run_id="run-1", model_version="v2", model_sha256="b" * 64, threshold=0.6)
+        )
+        session.commit()  # must not raise
+        assert session.query(ModelRun).count() == 2
 
     def test_model_run_repr(self):
         run = ModelRun(

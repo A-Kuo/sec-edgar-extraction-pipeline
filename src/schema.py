@@ -78,9 +78,22 @@ class FilingRaw(Base):
 
 
 class FinancialFact(Base):
-    """Parsed financial facts extracted from XBRL data."""
+    """
+    Parsed financial facts extracted from XBRL data.
+
+    ``fact_hash`` is a SHA-256 of the row's natural key (accession_number,
+    fact_name, period_start, period_end, segment) — see
+    ``src.upsert.compute_fact_hash``. It is the UPSERT conflict target: a
+    re-parse of the same filing (e.g. an Airflow retry after a worker crash
+    mid-batch) produces the identical hash for the identical fact and updates
+    the existing row instead of inserting a duplicate. Two independent facts
+    can never collide on it short of a SHA-256 collision, and any change to
+    the natural key (a different period, a different segment) is a different
+    fact by definition and correctly gets a different hash.
+    """
 
     __tablename__ = "financial_facts"
+    __table_args__ = (UniqueConstraint("fact_hash", name="uq_financial_facts_fact_hash"),)
 
     id: Mapped[int] = mapped_column(
         BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
@@ -99,6 +112,7 @@ class FinancialFact(Base):
     period_start: Mapped[date | None] = mapped_column(Date)
     period_end: Mapped[date | None] = mapped_column(Date, index=True)
     segment: Mapped[str | None] = mapped_column(String(256))
+    fact_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     parsed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -166,6 +180,12 @@ class ModelRun(Base):
     """
 
     __tablename__ = "model_runs"
+    __table_args__ = (
+        # One row per (run_id, model_version): a retried scoring task upserts
+        # the aggregate counts in place instead of orphaning the previous
+        # attempt's row and its fact_anomalies children.
+        UniqueConstraint("run_id", "model_version", name="uq_model_runs_run_id_version"),
+    )
 
     id: Mapped[int] = mapped_column(
         BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True

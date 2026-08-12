@@ -80,6 +80,7 @@ CREATE TABLE financial_facts (
   period_start DATE,
   period_end DATE,
   segment TEXT,
+  fact_hash CHAR(64) NOT NULL UNIQUE, -- sha256(accession|fact_name|period_start|period_end|segment)
   parsed_at TIMESTAMPTZ DEFAULT now()
 );
 
@@ -118,7 +119,8 @@ CREATE TABLE model_runs (
   threshold FLOAT NOT NULL,
   drift_report JSONB,
   drift_level TEXT,                   -- clean | warn | alert
-  created_at TIMESTAMPTZ DEFAULT now()
+  created_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE (run_id, model_version)
 );
 
 -- Per-filing anomaly score, joined back to model_runs
@@ -149,7 +151,7 @@ Surrogate primary keys are declared `BigInteger().with_variant(Integer, "sqlite"
 - Full-text search: `https://efts.sec.gov/LATEST/search-index?q=...`
 - SEC rate limit: 10 requests/second — enforced with a token-bucket limiter.
 - A `User-Agent` header is required by SEC; requests without one return 403.
-- Retries on 429/503 with exponential backoff, max 5 attempts.
+- Retries on 429/503 (and on request exceptions), max 5 attempts, with **full-jitter exponential backoff** (`full_jitter_backoff()`): `sleep = uniform(0, min(cap, base * 2**attempt))`. A deterministic backoff curve — sleep for exactly `backoff`, then double — makes every worker that hits the same rate limit retry in lockstep, which is itself a self-inflicted ban risk against a shared endpoint; drawing the actual sleep from a uniform distribution spreads retries across the window instead. A server-supplied `Retry-After` is still honored as a floor, with a few seconds of jitter added on top so identical `Retry-After` values don't resynchronize workers into the next wave.
 
 ### `xbrl_parser.py`
 Extracts a fixed set of target facts: `us-gaap:Revenues` (or `RevenueFromContractWithCustomerExcludingAssessedTax`), `NetIncomeLoss`, `Assets`, `Liabilities`, `OperatingIncomeLoss`, `EarningsPerShareBasic`, `CommonStockSharesOutstanding`. Handles instant vs. duration periods, unit conversion (thousands vs. millions), segment disaggregation, and amendment supersession (latest amendment wins).
@@ -173,6 +175,19 @@ Airflow-version compatibility: the module imports from both the Airflow 2.x and 
 
 ### `cache.py`
 Redis key patterns: `cik:{ticker}` (TTL 1h), `filings:{cik}` (TTL 24h), `facts:{accession_number}` (TTL 7d — parsed facts don't change).
+
+### `src/upsert.py` — idempotent writes
+
+Every DB write the DAG makes goes through this module as a single atomic `INSERT ... ON CONFLICT` statement, not a blind `INSERT` or a check-then-insert. This exists because `_bulk_insert_facts` used to call `session.bulk_save_objects(objects)` against a table with no natural-key constraint — an Airflow retry after a worker died mid-batch (`default_args["retries"] = 2`) would duplicate every fact already committed.
+
+- `financial_facts` — keyed on `fact_hash`, a SHA-256 of the fact's natural key (`compute_fact_hash()`: accession, concept, period, segment). A retry recomputes the identical hash and updates the row in place.
+- `filings_raw` — keyed on the existing `accession_number` PK, `DO NOTHING` on conflict: a retry re-landing an already-present accession is a no-op, not a silent overwrite.
+- `model_runs` — keyed on `(run_id, model_version)`, `DO UPDATE`. Replaced a delete-then-recreate pattern; the `id` (and therefore every `fact_anomalies` row referencing it) now stays stable across a retry instead of churning.
+- `fact_anomalies` — keyed on `(model_run_id, accession_number)`, matching `uq_anomaly_run_accession`.
+
+`_insert()` dispatches the dialect-specific `insert()` constructor (`sqlalchemy.dialects.postgresql` / `.sqlite`) by the bound engine's dialect name. Both expose an identical `.on_conflict_do_update()` / `.on_conflict_do_nothing()` API, which is what lets `tests/test_upsert.py` exercise the *real* conflict-resolution SQL against SQLite rather than mocking it — production runs the same Python against PostgreSQL, only the imported dialect module differs. `TestWorkerRestartMidBatch` in that file directly reproduces the failure mode: it replays a full and a partial batch after a simulated crash and asserts no duplicate rows result.
+
+The `financial_facts.fact_hash` and `model_runs (run_id, model_version)` constraints were added in migration `03255b5bee46`, which backfills `fact_hash` for any pre-existing rows using the real `compute_fact_hash()` (imported, not reimplemented in SQL) and defensively de-duplicates `model_runs` before adding its constraint.
 
 ### `src/ml/` — anomaly detection
 
@@ -231,6 +246,8 @@ Filing and fact reads check Redis before PostgreSQL. `/anomalies` and `/model/cu
 | ORM insert fails on SQLite with a NOT NULL error on `id` | The primary key needs `BigInteger().with_variant(Integer, "sqlite")`, not plain `BigInteger` — see the comment on `src.schema.Base` |
 | Per-feature drift alert on an equivalent population | Expected at small comparison-batch sizes (see "Known limitation" in `src/ml/monitoring.py`); check `prediction_level` instead, or compare batches of comparable size |
 | `evaluate_model.py` exits 2 | "Could not evaluate" — missing metrics file, or no models registered when using `--version`. Distinct from exit 1 ("failed the gate") |
+| A DB write duplicates rows on Airflow retry | Should not happen — every write goes through `src/upsert.py`'s `ON CONFLICT` helpers. If you're adding a new write path, use `src/upsert.py`, not `session.add()` / `bulk_save_objects()` directly, or you will reintroduce the bug that module exists to close |
+| Adding a new UPSERT target | The conflict column(s) need a real UNIQUE constraint in `src/schema.py` *and* a migration — `ON CONFLICT` silently becomes a no-op-free plain INSERT without one on some backends, or an outright error on others. Test against SQLite via `sqlalchemy.dialects.sqlite.insert()` first (see `tests/test_upsert.py`) — it enforces real conflict semantics without needing a live Postgres container |
 
 ## Agent Handoff Checklist
 
