@@ -34,15 +34,15 @@ class AlertPayload:
     """Structured alert message dispatched by the pipeline."""
 
     run_id: str
-    stage: str          # e.g. "validate", "parse"
-    status: str         # "failed"
+    stage: str  # e.g. "validate", "parse"
+    status: str  # "failed"
     error_message: str
     records_processed: int = 0
     extra: dict[str, Any] | None = None
 
     def as_text(self) -> str:
         lines = [
-            f"[SEC EDGAR Pipeline] Stage failed",
+            "[SEC EDGAR Pipeline] Stage failed",
             f"  run_id : {self.run_id}",
             f"  stage  : {self.stage}",
             f"  status : {self.status}",
@@ -92,7 +92,7 @@ def send_alert(payload: AlertPayload) -> None:
         try:
             _send_slack(payload, slack_url)
             dispatched = True
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.error("Slack alert failed: %s", exc)
 
     smtp_host = os.getenv("SMTP_HOST")
@@ -101,7 +101,7 @@ def send_alert(payload: AlertPayload) -> None:
         try:
             _send_email(payload, smtp_host, alert_email)
             dispatched = True
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.error("Email alert failed: %s", exc)
 
     if not dispatched:

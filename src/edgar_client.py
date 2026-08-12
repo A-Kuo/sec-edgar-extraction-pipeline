@@ -11,7 +11,6 @@ import logging
 import threading
 import time
 from typing import Any
-from urllib.parse import urlencode
 
 import requests
 from requests import Response, Session
@@ -109,7 +108,9 @@ class EdgarClient:
                 resp = self._session.get(url, params=params, timeout=30)
             except requests.RequestException as exc:
                 last_exc = exc
-                logger.warning("Request error (attempt %d/%d): %s", attempt + 1, self._max_retries + 1, exc)
+                logger.warning(
+                    "Request error (attempt %d/%d): %s", attempt + 1, self._max_retries + 1, exc
+                )
                 if attempt < self._max_retries:
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 60)

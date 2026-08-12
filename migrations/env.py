@@ -9,7 +9,7 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 # Import models so Alembic can see them for autogenerate.
-from src.schema import Base  # noqa: F401
+from src.schema import Base
 
 config = context.config
 

@@ -10,12 +10,18 @@ Task chain
       └── download_raw_documents
               └── parse_xbrl_facts
                       └── validate_quality_gates
-                              └── load_to_warehouse
-                                      └── update_audit_trail
-                                              └── send_alerts_on_failure  (ONE_FAILED)
+                              └── score_anomalies
+                                      └── load_to_warehouse
+                                              └── update_audit_trail
+                                                      └── send_alerts_on_failure  (ONE_FAILED)
 
 Every task writes a ``started`` row to ``pipeline_audit`` on entry and a
 ``completed`` / ``failed`` row on exit.
+
+``score_anomalies`` sits after the deterministic quality gates and before the
+load, so a filing arrives in the warehouse already carrying its anomaly score.
+It is the one non-blocking stage: model problems degrade to "no scores" rather
+than stopping filings that already passed the quality gates.
 
 Mock mode
 ---------
@@ -26,10 +32,8 @@ local development.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -43,14 +47,31 @@ MOCK_EDGAR: bool = os.getenv("MOCK_EDGAR", "false").lower() == "true"
 DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://sec_user:sec_pass@localhost/sec_edgar")
 
 # ---------------------------------------------------------------------------
-# Airflow imports (inside functions where possible so the module can be
-# imported without a running Airflow metastore during unit tests)
+# Airflow imports
+#
+# Airflow 3 relocated the operator, exception, and trigger-rule modules and
+# removed the `schedule_interval` DAG argument. These shims keep the DAG
+# importable on both 2.x and 3.x; `tests/test_dag_import.py` asserts the module
+# imports against whichever Airflow is actually installed, so a future
+# relocation fails CI instead of silently breaking the DAG.
 # ---------------------------------------------------------------------------
 
 from airflow import DAG
-from airflow.exceptions import AirflowFailException, AirflowSkipException
-from airflow.operators.python import PythonOperator
-from airflow.utils.trigger_rule import TriggerRule
+
+try:  # Airflow 3.x
+    from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
+except ImportError:  # Airflow 2.x
+    from airflow.exceptions import AirflowFailException, AirflowSkipException
+
+try:  # Airflow 3.x / apache-airflow-providers-standard
+    from airflow.providers.standard.operators.python import PythonOperator
+except ImportError:  # Airflow 2.x core
+    from airflow.operators.python import PythonOperator
+
+try:  # Airflow 3.x
+    from airflow.task.trigger_rule import TriggerRule
+except ImportError:  # Airflow 2.x
+    from airflow.utils.trigger_rule import TriggerRule
 
 # ---------------------------------------------------------------------------
 # Fixture data for MOCK_EDGAR=true
@@ -134,9 +155,7 @@ def _audit_failed(run_id: str, stage: str, error: str) -> None:
     _write_audit(run_id, stage, "failed", 0, error)
 
 
-def _write_audit(
-    run_id: str, stage: str, status: str, records: int, error: str | None
-) -> None:
+def _write_audit(run_id: str, stage: str, status: str, records: int, error: str | None) -> None:
     """Write a single row to pipeline_audit using SQLAlchemy."""
     from sqlalchemy import create_engine, text
 
@@ -148,8 +167,13 @@ def _write_audit(
                 "(run_id, stage, status, records_processed, error_message) "
                 "VALUES (:run_id, :stage, :status, :records, :error)"
             ),
-            {"run_id": run_id, "stage": stage, "status": status,
-             "records": records, "error": error},
+            {
+                "run_id": run_id,
+                "stage": stage,
+                "status": status,
+                "records": records,
+                "error": error,
+            },
         )
 
 
@@ -232,7 +256,8 @@ def download_raw_documents(**context: Any) -> list[str]:
                 try:
                     html = client.get_filing_document(
                         f"https://www.sec.gov/Archives/edgar/data/"
-                        f"{filing['cik']}/{filing['accession_number'].replace('-', '')}/")
+                        f"{filing['cik']}/{filing['accession_number'].replace('-', '')}/"
+                    )
                     _persist_raw_filing(filing, html, run_id)
                     downloaded.append(filing["accession_number"])
                 except Exception as exc:
@@ -321,6 +346,145 @@ def validate_quality_gates(**context: Any) -> None:
         raise
 
 
+def score_anomalies(**context: Any) -> dict[str, Any]:
+    """
+    Stage 5 — Score parsed facts with the promoted anomaly model.
+
+    Runs *after* the quality gates and *before* the load, so a filing reaches
+    the warehouse already carrying its score. Deliberately non-blocking: a
+    missing model, or a model that errors, logs and returns rather than failing
+    the DAG. Anomaly scoring is a review aid, and an outage in it must not stop
+    filings that passed the deterministic quality gates from landing.
+
+    Drift is the exception worth shouting about — an ALERT-level drift report
+    means the scores in this batch should not be trusted, so it is recorded on
+    the ``model_runs`` row and surfaced in the task's return value.
+    """
+    run_id: str = context["run_id"]
+    facts: list[dict] = context["ti"].xcom_pull(key="facts", task_ids="parse_xbrl_facts") or []
+    _audit_start(run_id, "score")
+
+    try:
+        if not facts:
+            _audit_complete(run_id, "score", 0)
+            raise AirflowSkipException("No facts to score — skipping anomaly detection.")
+
+        from src.ml.features import build_features
+        from src.ml.registry import ModelNotFoundError, ModelRegistry
+
+        registry = ModelRegistry(os.getenv("MODEL_REGISTRY_ROOT", "models"))
+
+        try:
+            detector, metadata = registry.load_production()
+        except (ModelNotFoundError, ValueError) as exc:
+            # ValueError here means an artifact hash mismatch — a tampered or
+            # corrupted model. Refusing to score is the correct response; using
+            # it anyway would attach unverifiable scores to audited records.
+            logger.warning("Anomaly scoring skipped: %s", exc)
+            _audit_complete(run_id, "score", 0)
+            return {"scored": 0, "flagged": 0, "reason": str(exc)}
+
+        filings = _filings_metadata_for(facts, context)
+        matrix = build_features(facts, filings)
+        scores = detector.score(matrix)
+        flagged = [s for s in scores if s.is_anomaly]
+
+        for score in flagged[:10]:
+            logger.warning("Anomaly %s — %s", score.accession_number, score.explain())
+
+        drift = _build_drift_report(detector, matrix, metadata)
+
+        if MOCK_EDGAR:
+            logger.info(
+                "[MOCK] scored %d filings with model %s, %d flagged",
+                len(scores),
+                metadata.version,
+                len(flagged),
+            )
+        else:
+            _persist_anomaly_scores(run_id, metadata, detector, scores, drift)
+
+        _audit_complete(run_id, "score", len(scores))
+
+        result = {
+            "scored": len(scores),
+            "flagged": len(flagged),
+            "model_version": metadata.version,
+            "drift_level": drift.worst_level.value if drift else None,
+        }
+        context["ti"].xcom_push(key="anomaly_summary", value=result)
+        return result
+
+    except AirflowSkipException:
+        raise
+    except Exception as exc:
+        # Scoring failures are recorded but never fail the DAG — see docstring.
+        logger.exception("Anomaly scoring failed for run=%s", run_id)
+        _audit_failed(run_id, "score", str(exc))
+        return {"scored": 0, "flagged": 0, "reason": str(exc)}
+
+
+def _filings_metadata_for(facts: list[dict], context: Any) -> dict[str, dict]:
+    """
+    Assemble the accession -> filing metadata map the continuity features need.
+
+    Falls back to the upstream XCom when the warehouse is unavailable; without
+    it the year-over-year features are neutral-filled rather than wrong.
+    """
+    upstream = context["ti"].xcom_pull(key="filings", task_ids="fetch_new_filings") or []
+    metadata = {f["accession_number"]: f for f in upstream if f.get("accession_number")}
+
+    if MOCK_EDGAR:
+        return metadata
+
+    accessions = sorted({f["accession_number"] for f in facts if f.get("accession_number")})
+    try:
+        metadata.update(_load_filing_metadata(accessions))
+    except Exception as exc:
+        logger.warning("Could not load filing metadata for continuity features: %s", exc)
+    return metadata
+
+
+def _build_drift_report(detector: Any, matrix: Any, metadata: Any) -> Any:
+    """
+    Compare this batch against the model's training baseline.
+
+    Returns None when no baseline snapshot is stored alongside the model — a
+    first run has nothing to drift from, and inventing a baseline would produce
+    a meaningless number.
+    """
+    from src.ml.monitoring import build_drift_report
+    from src.ml.registry import ModelRegistry
+
+    registry = ModelRegistry(os.getenv("MODEL_REGISTRY_ROOT", "models"))
+    baseline_path = registry.version_dir(metadata.version) / "baseline_features.npz"
+    if not baseline_path.exists():
+        logger.info("No baseline snapshot for %s — skipping drift check", metadata.version)
+        return None
+
+    try:
+        import numpy as np
+
+        from src.ml.features import FeatureMatrix
+
+        stored = np.load(baseline_path, allow_pickle=False)
+        baseline = FeatureMatrix(
+            X=stored["X"],
+            accessions=[str(a) for a in stored["accessions"]],
+            feature_names=tuple(str(n) for n in stored["feature_names"]),
+        )
+        return build_drift_report(
+            baseline,
+            matrix,
+            baseline_scores=detector.score_values(baseline).tolist(),
+            current_scores=detector.score_values(matrix).tolist(),
+            threshold=detector.threshold,
+        )
+    except Exception as exc:
+        logger.warning("Drift check failed (scores still valid): %s", exc)
+        return None
+
+
 def load_to_warehouse(**context: Any) -> int:
     """
     Stage 5 — Bulk-insert parsed facts into the PostgreSQL warehouse.
@@ -379,12 +543,8 @@ def send_alerts_on_failure(**context: Any) -> None:
 
     from src.alerts import send_pipeline_failure_alert
 
-    ti = context["ti"]
     # Find which task failed by inspecting the DAG run
-    failed_tasks = [
-        t for t in context["dag_run"].get_task_instances()
-        if t.state == "failed"
-    ]
+    failed_tasks = [t for t in context["dag_run"].get_task_instances() if t.state == "failed"]
     stage = failed_tasks[0].task_id if failed_tasks else "unknown"
     error = "One or more pipeline tasks failed"
 
@@ -403,22 +563,25 @@ def send_alerts_on_failure(**context: Any) -> None:
 def _persist_raw_filing(filing: dict, html: str, run_id: str) -> None:
     from sqlalchemy import create_engine
     from sqlalchemy.orm import Session
+
     from src.schema import FilingRaw
 
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
     with Session(engine) as session:
         existing = session.get(FilingRaw, filing["accession_number"])
         if existing is None:
-            session.add(FilingRaw(
-                accession_number=filing["accession_number"],
-                cik=filing["cik"],
-                ticker=filing.get("ticker"),
-                filing_type=filing["filing_type"],
-                filing_date=filing["filing_date"],
-                period_of_report=filing.get("period_of_report"),
-                raw_html=html,
-                pipeline_run_id=run_id,
-            ))
+            session.add(
+                FilingRaw(
+                    accession_number=filing["accession_number"],
+                    cik=filing["cik"],
+                    ticker=filing.get("ticker"),
+                    filing_type=filing["filing_type"],
+                    filing_date=filing["filing_date"],
+                    period_of_report=filing.get("period_of_report"),
+                    raw_html=html,
+                    pipeline_run_id=run_id,
+                )
+            )
             session.commit()
 
 
@@ -428,15 +591,114 @@ def _load_raw_html(accessions: list[str]) -> dict[str, str]:
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
     with engine.connect() as conn:
         rows = conn.execute(
-            text("SELECT accession_number, raw_html FROM filings_raw WHERE accession_number = ANY(:acc)"),
+            text(
+                "SELECT accession_number, raw_html FROM filings_raw WHERE accession_number = ANY(:acc)"
+            ),
             {"acc": accessions},
         ).fetchall()
     return {r[0]: r[1] for r in rows if r[1]}
 
 
+def _load_filing_metadata(accessions: list[str]) -> dict[str, dict]:
+    """Fetch cik / filing_date / period_of_report for the given accessions."""
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT accession_number, cik, filing_type, filing_date, period_of_report "
+                "FROM filings_raw WHERE accession_number = ANY(:acc)"
+            ),
+            {"acc": accessions},
+        ).fetchall()
+
+    return {
+        r[0]: {
+            "accession_number": r[0],
+            "cik": r[1],
+            "filing_type": r[2],
+            "filing_date": r[3],
+            "period_of_report": r[4],
+        }
+        for r in rows
+    }
+
+
+def _persist_anomaly_scores(
+    run_id: str,
+    metadata: Any,
+    detector: Any,
+    scores: list,
+    drift: Any,
+) -> None:
+    """
+    Write one ``model_runs`` row and its ``fact_anomalies`` children.
+
+    Scoring is re-runnable: a retried task deletes this run's prior scores
+    before inserting, so an Airflow retry replaces rather than duplicates.
+    Only ``fact_anomalies`` is rewritten — ``pipeline_audit`` stays append-only.
+    """
+    from sqlalchemy import create_engine, delete
+    from sqlalchemy.orm import Session
+
+    from src.schema import FactAnomaly, ModelRun
+
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    with Session(engine) as session:
+        existing = (
+            session.query(ModelRun)
+            .filter(ModelRun.run_id == run_id, ModelRun.model_version == metadata.version)
+            .one_or_none()
+        )
+        if existing is not None:
+            session.execute(delete(FactAnomaly).where(FactAnomaly.model_run_id == existing.id))
+            session.delete(existing)
+            session.flush()
+
+        model_run = ModelRun(
+            run_id=run_id,
+            model_version=metadata.version,
+            model_sha256=metadata.artifact_sha256,
+            git_sha=metadata.git_sha,
+            filings_scored=len(scores),
+            anomalies_flagged=sum(1 for s in scores if s.is_anomaly),
+            threshold=detector.threshold,
+            drift_report=drift.as_dict() if drift else None,
+            drift_level=drift.worst_level.value if drift else None,
+        )
+        session.add(model_run)
+        session.flush()  # assign model_run.id
+
+        session.add_all(
+            FactAnomaly(
+                model_run_id=model_run.id,
+                accession_number=s.accession_number,
+                score=s.score,
+                model_score=s.model_score,
+                rule_score=s.rule_score,
+                is_anomaly=s.is_anomaly,
+                triggered_by=s.triggered_by,
+                reason=s.explain(),
+                rule_violations=[v.as_dict() for v in s.rule_violations],
+                top_contributors=[[n, z] for n, z in s.top_contributors],
+            )
+            for s in scores
+        )
+        session.commit()
+
+    logger.info(
+        "Persisted %d anomaly scores for run=%s (model %s)",
+        len(scores),
+        run_id,
+        metadata.version,
+    )
+
+
 def _bulk_insert_facts(facts: list[dict]) -> int:
     from sqlalchemy import create_engine
     from sqlalchemy.orm import Session
+
     from src.schema import FinancialFact
 
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -456,20 +718,20 @@ default_args = {
     "depends_on_past": False,
     "retries": 2,
     "retry_delay": timedelta(minutes=5),
-    "email_on_failure": False,
 }
 
 with DAG(
     dag_id="edgar_pipeline",
     default_args=default_args,
     description="Daily SEC EDGAR 10-K/10-Q ingestion pipeline",
-    schedule_interval="@daily",
+    # `schedule` (not `schedule_interval`) — the latter was removed in Airflow 3
+    # and has been the supported spelling since 2.4.
+    schedule="@daily",
     start_date=datetime(2024, 1, 1),
     catchup=False,
     tags=["edgar", "ingestion", "data-engineering"],
     max_active_runs=1,
 ) as dag:
-
     task_fetch = PythonOperator(
         task_id="fetch_new_filings",
         python_callable=fetch_new_filings,
@@ -490,6 +752,11 @@ with DAG(
         python_callable=validate_quality_gates,
     )
 
+    task_score = PythonOperator(
+        task_id="score_anomalies",
+        python_callable=score_anomalies,
+    )
+
     task_load = PythonOperator(
         task_id="load_to_warehouse",
         python_callable=load_to_warehouse,
@@ -507,7 +774,23 @@ with DAG(
     )
 
     # Linear chain for the happy path
-    task_fetch >> task_download >> task_parse >> task_validate >> task_load >> task_audit
+    (
+        task_fetch
+        >> task_download
+        >> task_parse
+        >> task_validate
+        >> task_score
+        >> task_load
+        >> task_audit
+    )
 
     # Alert task depends on all pipeline tasks so it fires on any failure
-    [task_fetch, task_download, task_parse, task_validate, task_load, task_audit] >> task_alerts
+    [
+        task_fetch,
+        task_download,
+        task_parse,
+        task_validate,
+        task_score,
+        task_load,
+        task_audit,
+    ] >> task_alerts

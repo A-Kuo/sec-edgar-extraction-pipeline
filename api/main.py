@@ -7,10 +7,14 @@ Endpoints
   GET  /filings/{ticker}            list filings with metadata (paginated)
   GET  /filing/{accession}          parsed financial_facts for one filing
   GET  /facts/{ticker}/{fact_name}  time-series of a specific fact
+  GET  /anomalies/{ticker}          anomaly scores + reasons for a ticker
+  GET  /model/current               provenance of the promoted anomaly model
   POST /trigger/{ticker}            trigger on-demand ingestion
 
-All read endpoints check Redis before hitting PostgreSQL.
-Cache misses populate Redis so subsequent calls are served from memory.
+Fact and filing reads check Redis before hitting PostgreSQL; cache misses
+populate Redis so subsequent calls are served from memory. The anomaly and
+model endpoints deliberately bypass the cache — scores change whenever a new
+model is promoted, and serving a stale score is worse than serving a slow one.
 
 Run with:
     uvicorn api.main:app --reload
@@ -21,13 +25,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Generator
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Annotated, Any, Generator
+from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -159,6 +163,52 @@ class TriggerResponse(BaseModel):
     message: str
 
 
+class RuleViolationOut(BaseModel):
+    rule_id: str
+    severity: float
+    message: str
+
+
+class AnomalyRow(BaseModel):
+    accession_number: str
+    filing_type: str | None
+    filing_date: date | None
+    score: float
+    model_score: float
+    rule_score: float
+    is_anomaly: bool
+    triggered_by: str | None
+    reason: str | None
+    rule_violations: list[RuleViolationOut] = []
+    model_version: str
+    scored_at: datetime
+
+
+class AnomaliesResponse(BaseModel):
+    ticker: str
+    total: int
+    limit: int
+    offset: int
+    items: list[AnomalyRow]
+
+
+class ModelInfoResponse(BaseModel):
+    """Provenance of the model currently serving scores."""
+
+    version: str
+    trained_at: str
+    artifact_sha256: str
+    training_data_sha256: str
+    n_training_filings: int
+    git_sha: str
+    threshold: float
+    contamination: float
+    seed: int
+    feature_names: list[str]
+    metrics: dict[str, float]
+    verified: bool
+
+
 # ---------------------------------------------------------------------------
 # Helper: serialise Decimal / date for JSON cache storage
 # ---------------------------------------------------------------------------
@@ -173,6 +223,27 @@ def _to_json(obj: Any) -> str:
         raise TypeError(f"Not serialisable: {type(o)}")
 
     return json.dumps(obj, default=default)
+
+
+def _decode_violations(raw: Any) -> list[RuleViolationOut]:
+    """
+    Normalise a ``rule_violations`` column into typed rows.
+
+    SQLAlchemy's JSON type round-trips to a list on PostgreSQL but comes back as
+    a string from a raw ``text()`` query on SQLite, so both shapes are handled
+    rather than letting the response model differ by backend.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("Could not decode rule_violations payload: %.80s", raw)
+            return []
+    if not isinstance(raw, list):
+        return []
+    return [RuleViolationOut(**v) for v in raw if isinstance(v, dict)]
 
 
 def _lookup_cik(ticker: str, db: Session, cache: FilingCache) -> str | None:
@@ -274,7 +345,9 @@ def list_filings(
             "ticker": r[2],
             "filing_type": r[3],
             "filing_date": r[4].isoformat() if hasattr(r[4], "isoformat") else str(r[4]),
-            "period_of_report": r[5].isoformat() if r[5] and hasattr(r[5], "isoformat") else (str(r[5]) if r[5] else None),
+            "period_of_report": r[5].isoformat()
+            if r[5] and hasattr(r[5], "isoformat")
+            else (str(r[5]) if r[5] else None),
             "file_size_bytes": r[6],
             "ingested_at": r[7].isoformat() if hasattr(r[7], "isoformat") else str(r[7]),
         }
@@ -315,7 +388,9 @@ def get_filing_facts(
     if cached_facts is not None:
         # Fetch the filing metadata separately (not cached with facts)
         meta = db.execute(
-            text("SELECT filing_type, period_of_report FROM filings_raw WHERE accession_number = :a"),
+            text(
+                "SELECT filing_type, period_of_report FROM filings_raw WHERE accession_number = :a"
+            ),
             {"a": accession},
         ).fetchone()
         return FilingFactsResponse(
@@ -354,8 +429,12 @@ def get_filing_facts(
             "fact_name": r[2],
             "fact_value": float(r[3]) if r[3] is not None else None,
             "unit": r[4],
-            "period_start": r[5].isoformat() if r[5] and hasattr(r[5], "isoformat") else (str(r[5]) if r[5] else None),
-            "period_end": r[6].isoformat() if r[6] and hasattr(r[6], "isoformat") else (str(r[6]) if r[6] else None),
+            "period_start": r[5].isoformat()
+            if r[5] and hasattr(r[5], "isoformat")
+            else (str(r[5]) if r[5] else None),
+            "period_end": r[6].isoformat()
+            if r[6] and hasattr(r[6], "isoformat")
+            else (str(r[6]) if r[6] else None),
             "segment": r[7],
             "parsed_at": r[8].isoformat() if hasattr(r[8], "isoformat") else str(r[8]),
         }
@@ -447,6 +526,164 @@ def get_fact_time_series(
     )
 
 
+@app.get(
+    "/anomalies/{ticker}",
+    response_model=AnomaliesResponse,
+    summary="Anomaly scores for a ticker's filings",
+    description=(
+        "Returns the most recent anomaly score for each of a ticker's filings, "
+        "highest score first. Each row carries the reason it was flagged and the "
+        "model version that produced it, so a reviewer can action it without "
+        "re-running the model. Set `only_anomalies=true` to return just the "
+        "review queue. Not cached — scores change when a new model is promoted, "
+        "and a stale score is worse than a slow one."
+    ),
+    tags=["anomalies"],
+)
+def list_anomalies(
+    ticker: str,
+    db: DBDep,
+    only_anomalies: Annotated[
+        bool, Query(description="Return only filings flagged as anomalous")
+    ] = False,
+    min_score: Annotated[float, Query(ge=0.0, le=1.0)] = 0.0,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> AnomaliesResponse:
+    ticker_upper = ticker.upper()
+
+    # `fa.id IN (SELECT MAX(id) ...)` keeps only the newest score per filing, so
+    # re-scoring under a new model supersedes rather than duplicates. Expressed
+    # with MAX(id) rather than a window function to stay portable across the
+    # SQLite used in tests and the PostgreSQL used in production.
+    filters = ["UPPER(fr.ticker) = :ticker", "fa.score >= :min_score"]
+    if only_anomalies:
+        filters.append("fa.is_anomaly = TRUE")
+
+    where_clause = " AND ".join(filters)
+    params: dict[str, Any] = {
+        "ticker": ticker_upper,
+        "min_score": min_score,
+        "limit": limit,
+        "offset": offset,
+    }
+
+    rows = db.execute(
+        text(
+            f"""
+            SELECT fa.accession_number, fr.filing_type, fr.filing_date,
+                   fa.score, fa.model_score, fa.rule_score, fa.is_anomaly,
+                   fa.triggered_by, fa.reason, fa.rule_violations,
+                   mr.model_version, fa.scored_at
+            FROM fact_anomalies fa
+            JOIN filings_raw fr ON fr.accession_number = fa.accession_number
+            JOIN model_runs mr ON mr.id = fa.model_run_id
+            WHERE {where_clause}
+              AND fa.id IN (SELECT MAX(id) FROM fact_anomalies GROUP BY accession_number)
+            ORDER BY fa.score DESC, fa.accession_number
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        params,
+    ).fetchall()
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No anomaly scores found for ticker '{ticker}'. "
+                "The filings may not have been scored yet — check that a model "
+                "is promoted and the score_anomalies task has run."
+            ),
+        )
+
+    total = db.execute(
+        text(
+            f"""
+            SELECT COUNT(*)
+            FROM fact_anomalies fa
+            JOIN filings_raw fr ON fr.accession_number = fa.accession_number
+            WHERE {where_clause}
+              AND fa.id IN (SELECT MAX(id) FROM fact_anomalies GROUP BY accession_number)
+            """
+        ),
+        {"ticker": ticker_upper, "min_score": min_score},
+    ).scalar_one()
+
+    return AnomaliesResponse(
+        ticker=ticker_upper,
+        total=int(total),
+        limit=limit,
+        offset=offset,
+        items=[
+            AnomalyRow(
+                accession_number=r[0],
+                filing_type=r[1],
+                filing_date=r[2],
+                score=float(r[3]),
+                model_score=float(r[4]),
+                rule_score=float(r[5]),
+                is_anomaly=bool(r[6]),
+                triggered_by=r[7],
+                reason=r[8],
+                rule_violations=_decode_violations(r[9]),
+                model_version=r[10],
+                scored_at=r[11],
+            )
+            for r in rows
+        ],
+    )
+
+
+@app.get(
+    "/model/current",
+    response_model=ModelInfoResponse,
+    summary="Provenance of the promoted anomaly model",
+    description=(
+        "Returns the metadata of the model currently serving scores, including "
+        "the artifact SHA-256, the training-data hash, the git commit it was "
+        "trained from, and its evaluation metrics. `verified` is the result of "
+        "re-hashing the artifact on disk and comparing it against the digest "
+        "recorded at registration — false means the file has changed since it "
+        "was registered and its scores should not be trusted."
+    ),
+    tags=["ops"],
+)
+def model_info() -> ModelInfoResponse:
+    from src.ml.registry import ModelNotFoundError, ModelRegistry
+
+    registry = ModelRegistry(os.getenv("MODEL_REGISTRY_ROOT", "models"))
+
+    try:
+        version = registry.production_version()
+        if version is None:
+            raise ModelNotFoundError("No model has been promoted to production")
+        metadata = registry.get_metadata(version)
+    except (ModelNotFoundError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    try:
+        verified = registry.verify(version)
+    except (ValueError, FileNotFoundError) as exc:
+        logger.error("Model artifact verification failed for %s: %s", version, exc)
+        verified = False
+
+    return ModelInfoResponse(
+        version=metadata.version,
+        trained_at=metadata.trained_at,
+        artifact_sha256=metadata.artifact_sha256,
+        training_data_sha256=metadata.training_data_sha256,
+        n_training_filings=metadata.n_training_filings,
+        git_sha=metadata.git_sha,
+        threshold=metadata.threshold,
+        contamination=metadata.contamination,
+        seed=metadata.seed,
+        feature_names=metadata.feature_names,
+        metrics=metadata.metrics,
+        verified=verified,
+    )
+
+
 @app.post(
     "/trigger/{ticker}",
     response_model=TriggerResponse,
@@ -487,7 +724,7 @@ def trigger_ingestion(
     airflow_user = os.getenv("AIRFLOW_USER", "airflow")
     airflow_pass = os.getenv("AIRFLOW_PASSWORD", "airflow")
 
-    dag_run_payload = {
+    dag_run_payload: dict[str, Any] = {
         "conf": {"ticker": ticker_upper, "cik": cik},
         "note": f"On-demand trigger for {ticker_upper}",
     }

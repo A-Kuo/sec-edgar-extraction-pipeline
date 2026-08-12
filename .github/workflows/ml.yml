@@ -1,0 +1,211 @@
+name: Model CI
+
+# Retrains and gates the anomaly detector whenever anything that can change its
+# behaviour is touched. Model code lands through the same review process as
+# application code, with a metric floor that has to be cleared to merge.
+#
+# The whole job runs on the synthetic corpus (src/ml/synthetic.py) because CI
+# has no database and no route to sec.gov. That is a deliberate trade: the
+# absolute numbers are not production performance, but the *comparison* between
+# a candidate and the promoted baseline is valid, because both are measured on
+# the identical seeded corpus.
+
+on:
+  pull_request:
+    paths:
+      - "src/ml/**"
+      - "src/quality.py"
+      - "scripts/train_model.py"
+      - "scripts/evaluate_model.py"
+      - "models/**"
+      - ".github/workflows/ml.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/ml/**"
+      - "src/quality.py"
+      - "scripts/train_model.py"
+      - "scripts/evaluate_model.py"
+  workflow_dispatch:
+    inputs:
+      promote:
+        description: "Promote the trained model to PRODUCTION"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ml-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  MODEL_REGISTRY_ROOT: models
+
+permissions:
+  contents: read
+
+jobs:
+  train-and-gate:
+    name: Train, evaluate, gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Unit-test the ML layer first
+        # No point training if the feature builder or rule engine is broken —
+        # the model would train happily on wrong features and the gate would
+        # measure nonsense.
+        run: pytest tests/test_ml_features.py tests/test_ml_model.py tests/test_ml_registry.py tests/test_ml_monitoring.py -v
+
+      - name: Train candidate model
+        run: |
+          python -m scripts.train_model \
+            --synthetic \
+            --companies 200 \
+            --years 6 \
+            --data-seed 7 \
+            --seed 42 \
+            --contamination 0.05 \
+            --metrics-out artifacts/candidate-metrics.json \
+            --notes "CI build ${{ github.sha }}"
+
+      - name: Assert training is reproducible
+        # Train a second time with identical flags into a scratch registry. Same
+        # inputs must yield the same artifact hash — that identity is what lets
+        # the registry treat a hash as proof of which model produced a score.
+        run: |
+          python -m scripts.train_model \
+            --synthetic --companies 200 --years 6 --data-seed 7 \
+            --seed 42 --contamination 0.05 \
+            --registry /tmp/reproducibility-check \
+            --notes "reproducibility check"
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          def artifact_hash(root: str) -> str:
+              versions = sorted(p for p in Path(root).iterdir() if p.is_dir() and (p / "metadata.json").exists())
+              return json.loads((versions[-1] / "metadata.json").read_text())["artifact_sha256"]
+
+          first = artifact_hash("models")
+          second = artifact_hash("/tmp/reproducibility-check")
+          print(f"run 1: {first}\nrun 2: {second}")
+          assert first == second, (
+              "Training is not reproducible: identical flags produced different artifacts. "
+              "Something in the training path depends on unseeded state."
+          )
+          print("Reproducible: identical artifact hash across runs.")
+          PY
+
+      - name: Gate against floors and the promoted baseline
+        run: |
+          python -m scripts.evaluate_model \
+            --metrics artifacts/candidate-metrics.json \
+            --summary-out artifacts/gate-summary.md
+
+      - name: Publish gate summary
+        if: always()
+        run: |
+          if [ -f artifacts/gate-summary.md ]; then
+            cat artifacts/gate-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Attach model card to the run
+        if: always()
+        run: |
+          card=$(find models -name MODEL_CARD.md | sort | tail -1)
+          if [ -n "$card" ]; then
+            { echo; echo "<details><summary>Model card</summary>"; echo; cat "$card"; echo; echo "</details>"; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Verify artifact integrity
+        run: python -m scripts.evaluate_model --verify-only --version latest
+
+      - name: Upload model artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-candidate-${{ github.sha }}
+          path: |
+            models/
+            artifacts/
+          retention-days: 30
+
+      - name: Drift monitor sanity check
+        # Two-sided check on the monitor itself, not on the model:
+        #
+        #   1. An equivalent population must NOT raise a prediction-drift alert.
+        #      A monitor that cries wolf gets muted, and then it is worth
+        #      nothing when something real happens.
+        #   2. A genuinely shifted population MUST alert. A monitor that never
+        #      fires is equally worthless, and only the second half proves the
+        #      first half is not passing by being permanently asleep.
+        #
+        # The comparison corpus is the same size as the training corpus on
+        # purpose. Filings cluster by company, so 60 companies is ~60
+        # independent draws however many filings they produce, and PSI computed
+        # on that reads as drift when it is really sampling noise.
+        run: |
+          python - <<'PY'
+          from src.ml.features import build_features
+          from src.ml.monitoring import build_drift_report
+          from src.ml.registry import ModelRegistry
+          from src.ml.synthetic import generate_corpus
+
+          registry = ModelRegistry("models")
+          detector, _ = registry.load(registry.latest_version())
+
+          train = generate_corpus(200, 6, seed=7)
+          baseline = build_features(train.facts, train.filings)
+          baseline_scores = detector.score_values(baseline).tolist()
+
+          def report_for(corpus):
+              current = build_features(corpus.facts, corpus.filings)
+              return build_drift_report(
+                  baseline,
+                  current,
+                  baseline_scores=baseline_scores,
+                  current_scores=detector.score_values(current).tolist(),
+                  threshold=detector.threshold,
+              )
+
+          # 1. Equivalent population -> quiet.
+          quiet = report_for(generate_corpus(200, 6, seed=808))
+          print("equivalent population:", quiet.summary())
+          assert quiet.prediction_level.value != "alert", (
+              f"Prediction drift alerted on an equivalent population: {quiet.summary()}"
+          )
+          assert not quiet.flag_rate_anomalous, (
+              f"Flag rate moved on an equivalent population: "
+              f"{quiet.baseline_flag_rate:.3f} -> {quiet.current_flag_rate:.3f}"
+          )
+
+          # 2. Shifted population -> alert. Revenue inflated 1000x across the
+          #    board, i.e. a systematic scale regression in the parser.
+          shifted = generate_corpus(200, 6, seed=808)
+          for fact in shifted.facts:
+              if fact["fact_name"] == "us-gaap:Revenues":
+                  fact["fact_value"] *= 1000
+
+          loud = report_for(shifted)
+          print("shifted population:  ", loud.summary()[:160])
+          assert loud.worst_level.value == "alert", (
+              f"Drift monitor stayed quiet on a 1000x revenue shift: {loud.summary()}"
+          )
+
+          print("Drift monitor discriminates: quiet on equivalent, alert on shifted.")
+          PY

@@ -10,11 +10,10 @@ Covers:
 from __future__ import annotations
 
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 import requests
-import requests_mock as req_mock_module
 
 from src.edgar_client import (
     COMPANY_FACTS_URL,
@@ -22,7 +21,6 @@ from src.edgar_client import (
     EdgarClient,
     _TokenBucket,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -203,9 +201,8 @@ class TestRetryOn503:
         requests_mock.get(url, status_code=503)
 
         client = make_client(max_retries=2)
-        with patch("src.edgar_client.time.sleep"):
-            with pytest.raises(requests.HTTPError):
-                client.get_company_filings(SAMPLE_CIK)
+        with patch("src.edgar_client.time.sleep"), pytest.raises(requests.HTTPError):
+            client.get_company_filings(SAMPLE_CIK)
 
         # 1 initial + 2 retries = 3 total
         assert requests_mock.call_count == 3
@@ -326,7 +323,9 @@ class TestRateLimitingIntegration:
 
 class TestGetFilingDocument:
     def test_returns_html_text(self, requests_mock):
-        doc_url = "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/aapl-20240928.htm"
+        doc_url = (
+            "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/aapl-20240928.htm"
+        )
         requests_mock.get(doc_url, text="<html><body>Annual Report</body></html>")
 
         client = make_client()

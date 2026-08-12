@@ -23,7 +23,15 @@ import argparse
 import logging
 import os
 import sys
-from datetime import date, datetime
+from datetime import date
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sqlalchemy.engine import Engine
+
+    from src.cache import FilingCache
+    from src.edgar_client import EdgarClient
+    from src.xbrl_parser import XBRLParser
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,9 +94,9 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _resolve_ciks(tickers: list[str], client) -> list[str]:
+def _resolve_ciks(tickers: list[str], client: EdgarClient) -> list[str]:
     """Resolve ticker symbols to CIK strings via EDGAR."""
-    ciks = []
+    ciks: list[str] = []
     for ticker in tickers:
         try:
             # EDGAR ticker-to-CIK: search the company tickers JSON
@@ -127,10 +135,10 @@ def _ingest_cik(
     end_date: str,
     form_types: list[str],
     dry_run: bool,
-    client,
-    parser,
-    engine,
-    cache,
+    client: EdgarClient,
+    parser: XBRLParser,
+    engine: Engine,
+    cache: FilingCache | None,
 ) -> tuple[int, int]:
     """
     Ingest all matching filings for a single CIK.
@@ -138,6 +146,7 @@ def _ingest_cik(
     Returns (filings_processed, facts_inserted).
     """
     from sqlalchemy.orm import Session
+
     from src.schema import FilingRaw, FinancialFact
 
     logger.info("Fetching submission history for CIK %s", cik)
@@ -161,13 +170,16 @@ def _ingest_cik(
             "period_of_report": periods[i] if i < len(periods) else None,
         }
         for i in range(len(accessions))
-        if forms[i] in form_types
-        and start_date <= dates[i] <= end_date
+        if forms[i] in form_types and start_date <= dates[i] <= end_date
     ]
 
     logger.info(
         "CIK %s: %d filings in range [%s, %s] for form(s) %s",
-        cik, len(candidates), start_date, end_date, form_types,
+        cik,
+        len(candidates),
+        start_date,
+        end_date,
+        form_types,
     )
 
     if dry_run:
@@ -188,8 +200,7 @@ def _ingest_cik(
 
             if cached_facts is None:
                 html = client.get_filing_document(
-                    f"https://www.sec.gov/Archives/edgar/data/"
-                    f"{cik}/{acc.replace('-', '')}/"
+                    f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc.replace('-', '')}/"
                 )
                 fact_rows = parser.parse(html, acc)
             else:
@@ -218,7 +229,6 @@ def _ingest_cik(
                         d = row.as_dict()
                         # Convert Decimal to float for SQLAlchemy
                         if d.get("fact_value") is not None:
-                            from decimal import Decimal as _D
                             d["fact_value"] = float(d["fact_value"])
                         session.add(FinancialFact(**d))
                     facts_total += len(fact_rows)
@@ -247,9 +257,10 @@ def main() -> None:
     redis_url = os.getenv("REDIS_URL")
 
     from sqlalchemy import create_engine
+
+    from src.cache import FilingCache
     from src.edgar_client import EdgarClient
     from src.xbrl_parser import XBRLParser
-    from src.cache import FilingCache
 
     engine = create_engine(database_url, pool_pre_ping=True)
     client = EdgarClient()

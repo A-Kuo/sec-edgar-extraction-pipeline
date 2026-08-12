@@ -1,19 +1,29 @@
 """
-Tests for dags/edgar_pipeline.py
+Tests for dags/edgar_pipeline.py — structure and task-callable behaviour.
 
-Because apache-airflow requires Python ≤ 3.12 and this environment uses
-Python 3.14, all Airflow classes are replaced with lightweight mocks injected
-into sys.modules BEFORE the dag module is imported.  The mocks faithfully
-replicate the ``>>`` operator chaining and trigger_rule plumbing so every
-structural assertion is meaningful.
+Airflow classes are replaced with lightweight mocks injected into
+sys.modules BEFORE the dag module is imported, so these tests run in
+milliseconds with no metastore and no dependency on which Airflow version
+happens to be installed. The mocks faithfully replicate the ``>>`` operator
+chaining and trigger_rule plumbing so the structural assertions below are
+meaningful.
+
+What this file deliberately does NOT cover: whether the DAG actually imports
+against a real, installed Airflow. It once did not — an unbounded
+``apache-airflow>=2.8.0`` pin resolved to Airflow 3.x, which removed the
+``schedule_interval`` argument and relocated several modules, and this whole
+suite stayed green because the mocks never exercised the real import path.
+That gap is closed by ``tests/test_dag_import.py``, which imports the module
+in a subprocess against whatever Airflow is actually installed. Treat the two
+files as a pair: this one for structure, that one for "does it actually run".
 
 Covers:
-  - DAG has the correct 7 task IDs
-  - Linear dependency chain (1 → 2 → … → 6)
+  - DAG has the correct 8 task IDs (including score_anomalies)
+  - Linear dependency chain (1 → 2 → … → 7)
   - All pipeline tasks are upstream of send_alerts_on_failure
   - send_alerts_on_failure uses TriggerRule.ONE_FAILED
   - Task callables can be invoked in MOCK_EDGAR mode
-  - AirflowSkipException raised on empty facts (validate stage)
+  - AirflowSkipException raised on empty facts (validate, score stages)
   - Mock fixture data integrity (required keys, required facts)
 """
 
@@ -35,6 +45,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 # ── Exceptions ──────────────────────────────────────────────────────────────
 
+
 class AirflowSkipException(Exception):
     pass
 
@@ -45,6 +56,7 @@ class AirflowFailException(Exception):
 
 # ── TriggerRule ─────────────────────────────────────────────────────────────
 
+
 class TriggerRule:
     ONE_FAILED = "one_failed"
     ALL_SUCCESS = "all_success"
@@ -53,10 +65,11 @@ class TriggerRule:
 
 # ── PythonOperator ───────────────────────────────────────────────────────────
 
+
 class PythonOperator:
     """Minimal PythonOperator stub tracking task graph edges."""
 
-    _active_dag: "DAG | None" = None
+    _active_dag: DAG | None = None
 
     def __init__(
         self,
@@ -104,17 +117,21 @@ class PythonOperator:
 
 # ── DAG ─────────────────────────────────────────────────────────────────────
 
+
 class DAG:
     def __init__(self, dag_id: str, **kwargs) -> None:
         self.dag_id = dag_id
-        self.schedule_interval = kwargs.get("schedule_interval")
+        # Airflow 3 renamed `schedule_interval` to `schedule`; accept either so
+        # this mock tracks dags/edgar_pipeline.py regardless of which the
+        # installed Airflow (or this file) uses.
+        self.schedule_interval = kwargs.get("schedule", kwargs.get("schedule_interval"))
         self.catchup = kwargs.get("catchup", True)
         self.max_active_runs = kwargs.get("max_active_runs", 16)
         self.default_args = kwargs.get("default_args", {})
         self.tags = kwargs.get("tags", [])
         self._tasks: list[PythonOperator] = []
 
-    def __enter__(self) -> "DAG":
+    def __enter__(self) -> DAG:
         PythonOperator._active_dag = self
         return self
 
@@ -130,6 +147,7 @@ class DAG:
 
 
 # ── Inject into sys.modules ──────────────────────────────────────────────────
+
 
 def _make_mod(**attrs):
     m = MagicMock()
@@ -149,9 +167,9 @@ sys.modules["airflow.utils"] = MagicMock()
 sys.modules["airflow.utils.trigger_rule"] = _make_mod(TriggerRule=TriggerRule)
 
 # Now it is safe to import the DAG module.
-import dags.edgar_pipeline as dag_module  # noqa: E402
-
 import pytest  # noqa: E402
+
+import dags.edgar_pipeline as dag_module  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Shared constants
@@ -162,6 +180,7 @@ EXPECTED_TASK_IDS = {
     "download_raw_documents",
     "parse_xbrl_facts",
     "validate_quality_gates",
+    "score_anomalies",
     "load_to_warehouse",
     "update_audit_trail",
     "send_alerts_on_failure",
@@ -172,6 +191,7 @@ LINEAR_CHAIN = [
     "download_raw_documents",
     "parse_xbrl_facts",
     "validate_quality_gates",
+    "score_anomalies",
     "load_to_warehouse",
     "update_audit_trail",
 ]
@@ -197,8 +217,8 @@ class TestDAGStructure:
         assert dag.dag_id == "edgar_pipeline"
 
     def test_task_count(self, dag):
-        assert len(dag.task_ids) == 7, (
-            f"Expected 7 tasks, got {len(dag.task_ids)}: {sorted(dag.task_ids)}"
+        assert len(dag.task_ids) == 8, (
+            f"Expected 8 tasks, got {len(dag.task_ids)}: {sorted(dag.task_ids)}"
         )
 
     def test_all_expected_task_ids_present(self, dag):
@@ -298,6 +318,29 @@ class TestTaskCallablesInMockMode:
         ctx["ti"].xcom_pull.return_value = []
         with pytest.raises(AirflowSkipException):
             dag_module.validate_quality_gates(**ctx)
+
+    def test_score_anomalies_skips_without_a_promoted_model(self, tmp_path, monkeypatch):
+        """
+        No model has been registered/promoted in this test environment.
+        score_anomalies must degrade to "no scores" rather than fail the
+        DAG — an outage in the ML stage must never block filings that already
+        passed the deterministic quality gates.
+        """
+        monkeypatch.setenv("MODEL_REGISTRY_ROOT", str(tmp_path / "empty-registry"))
+        ctx = _make_context()
+        ctx["ti"].xcom_pull.return_value = dag_module._MOCK_FACTS
+
+        result = dag_module.score_anomalies(**ctx)  # must not raise
+
+        assert result["scored"] == 0
+        assert result["flagged"] == 0
+        assert "reason" in result
+
+    def test_score_anomalies_raises_skip_on_empty_facts(self):
+        ctx = _make_context()
+        ctx["ti"].xcom_pull.return_value = []
+        with pytest.raises(AirflowSkipException):
+            dag_module.score_anomalies(**ctx)
 
     def test_load_to_warehouse_returns_count(self):
         ctx = _make_context()

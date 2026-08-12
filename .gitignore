@@ -26,8 +26,28 @@ env/
 # pytest / coverage
 .pytest_cache/
 .coverage
+coverage.xml
 htmlcov/
 .tox/
+
+# Lint / type-check caches
+.mypy_cache/
+.ruff_cache/
+
+# Model registry — artifacts are built by CI and published as workflow
+# artifacts, not committed. Binary blobs in git history are permanent and
+# unprunable, and a model is reproducible from its metadata anyway.
+models/
+artifacts/
+*.joblib
+*.npz
+
+# Local databases
+*.db
+*.sqlite3
+
+# Airflow local state
+airflow/
 
 # Alembic
 # (keep migrations/versions/*.py but ignore pyc inside)

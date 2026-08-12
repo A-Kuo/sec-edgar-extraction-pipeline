@@ -29,9 +29,10 @@ Handles
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -155,10 +156,7 @@ class XBRLParser:
             target_facts:     Set of concept names to extract.
             include_segments: If False, skip non-consolidated (segment) rows.
         """
-        if isinstance(html_content, str):
-            html_bytes = html_content.encode("utf-8")
-        else:
-            html_bytes = html_content
+        html_bytes = html_content.encode("utf-8") if isinstance(html_content, str) else html_content
 
         root = self._parse_tree(html_bytes)
         contexts = self._extract_contexts(root)
@@ -224,18 +222,16 @@ class XBRLParser:
                         ctx.period_end = _parse_date(end.text.strip())
 
             # Segment — lives inside xbrli:entity, so needs descendant search
-            seg_results = ctx_elem.xpath(
-                ".//xbrli:segment", namespaces=_NSMAP
-            ) or ctx_elem.xpath(".//*[local-name()='segment']")
+            seg_results = ctx_elem.xpath(".//xbrli:segment", namespaces=_NSMAP) or ctx_elem.xpath(
+                ".//*[local-name()='segment']"
+            )
             segment_elem = seg_results[0] if seg_results else None
             if segment_elem is not None:
                 members = segment_elem.xpath(
                     "xbrldi:explicitMember", namespaces=_NSMAP
                 ) or segment_elem.xpath(".//*[local-name()='explicitMember']")
                 if members:
-                    ctx.segment = "; ".join(
-                        m.text.strip() for m in members if m.text
-                    )
+                    ctx.segment = "; ".join(m.text.strip() for m in members if m.text)
 
             contexts[ctx_id] = ctx
 
@@ -297,9 +293,9 @@ class XBRLParser:
         rows: list[FinancialFactRow] = []
 
         # Find all ix:nonFraction elements (namespace-aware + fallback)
-        fact_elems = root.xpath(
-            "//ix:nonFraction", namespaces=_NSMAP
-        ) or root.xpath("//*[local-name()='nonFraction']")
+        fact_elems = root.xpath("//ix:nonFraction", namespaces=_NSMAP) or root.xpath(
+            "//*[local-name()='nonFraction']"
+        )
 
         for elem in fact_elems:
             name = elem.get("name", "")
@@ -373,9 +369,7 @@ def apply_amendment_supersession(
 # ---------------------------------------------------------------------------
 
 
-def _first(
-    parent: etree._Element, ns_name: str, local_name: str
-) -> etree._Element | None:
+def _first(parent: etree._Element, ns_name: str, local_name: str) -> etree._Element | None:
     """Return the first child matching namespace-qualified or local-name."""
     results = parent.xpath(ns_name, namespaces=_NSMAP) or parent.xpath(
         f"*[local-name()='{local_name}']"
@@ -436,10 +430,8 @@ def _parse_fact_value(elem: etree._Element) -> Decimal | None:
 
     scale_attr = elem.get("scale")
     if scale_attr:
-        try:
+        with contextlib.suppress(ValueError, InvalidOperation):
             value = value * Decimal(10) ** int(scale_attr)
-        except (ValueError, InvalidOperation):
-            pass
 
     sign_attr = elem.get("sign")
     if sign_attr == "-":

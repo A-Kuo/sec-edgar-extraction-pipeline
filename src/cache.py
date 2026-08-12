@@ -31,9 +31,9 @@ logger = logging.getLogger(__name__)
 # TTL constants (seconds)
 # ---------------------------------------------------------------------------
 
-TTL_CIK: int = 3_600       # 1 hour   — ticker→CIK lookups
+TTL_CIK: int = 3_600  # 1 hour   — ticker→CIK lookups
 TTL_FILINGS: int = 86_400  # 24 hours — company filing index
-TTL_FACTS: int = 604_800   # 7 days   — parsed XBRL facts (immutable once filed)
+TTL_FACTS: int = 604_800  # 7 days   — parsed XBRL facts (immutable once filed)
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +105,12 @@ class FilingCache:
 
     def get_cik(self, ticker: str) -> str | None:
         """Return the CIK for *ticker*, or None on miss."""
-        return self._client().get(f"cik:{ticker.upper()}")
+        # redis-py's stubs type get() as bytes | str | None regardless of
+        # decode_responses, since that flag isn't visible to the type checker;
+        # the client is constructed with decode_responses=True, so this is
+        # always a str at runtime.
+        value = self._client().get(f"cik:{ticker.upper()}")
+        return value if value is None else str(value)
 
     def set_cik(self, ticker: str, cik: str) -> None:
         """Cache the CIK for *ticker* for 1 hour."""

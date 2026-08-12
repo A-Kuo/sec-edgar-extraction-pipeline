@@ -22,11 +22,9 @@ from __future__ import annotations
 from datetime import date, datetime
 from unittest.mock import MagicMock, patch
 
-import pytest
 from fastapi.testclient import TestClient
 
 from api.main import app, get_cache, get_db
-
 
 # ---------------------------------------------------------------------------
 # Shared row fixtures
@@ -37,37 +35,37 @@ _TODAY = date(2024, 11, 1)
 
 _FILING_ROW = (
     "0000320193-24-000123",  # accession_number
-    "320193",                # cik
-    "AAPL",                  # ticker
-    "10-K",                  # filing_type
-    date(2024, 11, 1),       # filing_date
-    date(2024, 9, 28),       # period_of_report
-    5_000_000,               # file_size_bytes
-    _NOW,                    # ingested_at
+    "320193",  # cik
+    "AAPL",  # ticker
+    "10-K",  # filing_type
+    date(2024, 11, 1),  # filing_date
+    date(2024, 9, 28),  # period_of_report
+    5_000_000,  # file_size_bytes
+    _NOW,  # ingested_at
 )
 
 _FACT_ROW = (
-    1,                             # id
-    "0000320193-24-000123",        # accession_number
-    "us-gaap:Revenues",            # fact_name
-    391_035_000_000.0,             # fact_value
-    "USD",                         # unit
-    date(2023, 10, 1),             # period_start
-    date(2024, 9, 28),             # period_end
-    None,                          # segment
-    _NOW,                          # parsed_at
+    1,  # id
+    "0000320193-24-000123",  # accession_number
+    "us-gaap:Revenues",  # fact_name
+    391_035_000_000.0,  # fact_value
+    "USD",  # unit
+    date(2023, 10, 1),  # period_start
+    date(2024, 9, 28),  # period_end
+    None,  # segment
+    _NOW,  # parsed_at
 )
 
 _META_ROW = ("10-K", date(2024, 9, 28))
 
 _TS_ROW = (
     "0000320193-24-000123",  # accession_number
-    "10-K",                  # filing_type
-    date(2023, 10, 1),       # period_start
-    date(2024, 9, 28),       # period_end
-    391_035_000_000.0,       # fact_value
-    "USD",                   # unit
-    None,                    # segment
+    "10-K",  # filing_type
+    date(2023, 10, 1),  # period_start
+    date(2024, 9, 28),  # period_end
+    391_035_000_000.0,  # fact_value
+    "USD",  # unit
+    None,  # segment
 )
 
 
@@ -401,6 +399,172 @@ class TestTimeSeries:
 
 
 # ---------------------------------------------------------------------------
+# GET /anomalies/{ticker}
+# ---------------------------------------------------------------------------
+
+_ANOMALY_ROW = (
+    "0000320193-24-000123",  # accession_number
+    "10-K",  # filing_type
+    _TODAY,  # filing_date
+    0.82,  # score
+    0.40,  # model_score
+    0.82,  # rule_score
+    True,  # is_anomaly
+    "rule",  # triggered_by
+    "score=0.820 — eps_reconciliation_failed: ...",  # reason
+    '[{"rule_id": "eps_reconciliation_failed", "severity": 0.82, "message": "..."}]',
+    "v20260101T000000Z-abcd1234",  # model_version
+    _NOW,  # scored_at
+)
+
+
+class TestAnomalies:
+    def setup_method(self):
+        _clear_overrides()
+
+    def test_returns_200_with_rows(self):
+        db = _mock_db_execute(fetchall=[_ANOMALY_ROW])
+        db.execute.return_value.scalar_one.return_value = 1
+        cache = _mock_cache()
+        client = _override(db=db, cache=cache)
+        resp = client.get("/anomalies/AAPL")
+        assert resp.status_code == 200
+
+    def test_response_schema(self):
+        db = _mock_db_execute(fetchall=[_ANOMALY_ROW])
+        db.execute.return_value.scalar_one.return_value = 1
+        cache = _mock_cache()
+        client = _override(db=db, cache=cache)
+        body = client.get("/anomalies/AAPL").json()
+        assert body["ticker"] == "AAPL"
+        assert body["total"] == 1
+        item = body["items"][0]
+        assert item["accession_number"] == "0000320193-24-000123"
+        assert item["is_anomaly"] is True
+        assert item["triggered_by"] == "rule"
+        assert item["rule_violations"][0]["rule_id"] == "eps_reconciliation_failed"
+
+    def test_404_when_nothing_scored(self):
+        db = _mock_db_execute(fetchall=[])
+        cache = _mock_cache()
+        client = _override(db=db, cache=cache)
+        resp = client.get("/anomalies/UNSCORED")
+        assert resp.status_code == 404
+
+    def test_only_anomalies_filter_is_passed_through(self):
+        db = _mock_db_execute(fetchall=[_ANOMALY_ROW])
+        db.execute.return_value.scalar_one.return_value = 1
+        cache = _mock_cache()
+        client = _override(db=db, cache=cache)
+        resp = client.get("/anomalies/AAPL?only_anomalies=true")
+        assert resp.status_code == 200
+        # is_anomaly = TRUE must appear in at least one executed query
+        queries = [str(call.args[0]) for call in db.execute.call_args_list]
+        assert any("is_anomaly = TRUE" in q for q in queries)
+
+    def test_min_score_query_param_bounds(self):
+        db = _mock_db_execute(fetchall=[_ANOMALY_ROW])
+        db.execute.return_value.scalar_one.return_value = 1
+        cache = _mock_cache()
+        client = _override(db=db, cache=cache)
+        assert client.get("/anomalies/AAPL?min_score=1.5").status_code == 422
+        assert client.get("/anomalies/AAPL?min_score=-0.1").status_code == 422
+
+    def test_rule_violations_decoded_from_json_string(self):
+        """Raw text() queries return JSON as a string on SQLite, unlike PostgreSQL."""
+        db = _mock_db_execute(fetchall=[_ANOMALY_ROW])
+        db.execute.return_value.scalar_one.return_value = 1
+        cache = _mock_cache()
+        client = _override(db=db, cache=cache)
+        body = client.get("/anomalies/AAPL").json()
+        assert isinstance(body["items"][0]["rule_violations"], list)
+
+    def test_null_rule_violations_becomes_empty_list(self):
+        row = list(_ANOMALY_ROW)
+        row[9] = None
+        db = _mock_db_execute(fetchall=[tuple(row)])
+        db.execute.return_value.scalar_one.return_value = 1
+        cache = _mock_cache()
+        client = _override(db=db, cache=cache)
+        body = client.get("/anomalies/AAPL").json()
+        assert body["items"][0]["rule_violations"] == []
+
+    def test_pagination_params_accepted(self):
+        db = _mock_db_execute(fetchall=[_ANOMALY_ROW])
+        db.execute.return_value.scalar_one.return_value = 1
+        cache = _mock_cache()
+        client = _override(db=db, cache=cache)
+        body = client.get("/anomalies/AAPL?limit=10&offset=5").json()
+        assert body["limit"] == 10
+        assert body["offset"] == 5
+
+
+# ---------------------------------------------------------------------------
+# GET /model/current
+# ---------------------------------------------------------------------------
+
+
+class TestModelInfo:
+    def setup_method(self):
+        _clear_overrides()
+
+    def _make_registry(self, tmp_path):
+        from src.ml.features import build_features
+        from src.ml.model import AnomalyDetector
+        from src.ml.registry import ModelRegistry
+
+        facts = [
+            {
+                "accession_number": "A",
+                "fact_name": "us-gaap:Revenues",
+                "fact_value": 100.0,
+                "period_end": "2024-12-31",
+            },
+            {
+                "accession_number": "B",
+                "fact_name": "us-gaap:Revenues",
+                "fact_value": 200.0,
+                "period_end": "2024-12-31",
+            },
+        ]
+        matrix = build_features(facts)
+        detector = AnomalyDetector(seed=1).fit(matrix)
+        registry = ModelRegistry(tmp_path / "models")
+        metadata = registry.register(detector, matrix, metrics={"recall": 0.9})
+        registry.promote(metadata.version)
+        return registry, metadata
+
+    def test_returns_metadata_of_promoted_model(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MODEL_REGISTRY_ROOT", str(tmp_path / "models"))
+        _, metadata = self._make_registry(tmp_path)
+
+        client = TestClient(app)
+        resp = client.get("/model/current")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["version"] == metadata.version
+        assert body["artifact_sha256"] == metadata.artifact_sha256
+        assert body["verified"] is True
+
+    def test_404_when_nothing_promoted(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MODEL_REGISTRY_ROOT", str(tmp_path / "empty"))
+        client = TestClient(app)
+        resp = client.get("/model/current")
+        assert resp.status_code == 404
+
+    def test_tampered_artifact_reports_unverified_not_500(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MODEL_REGISTRY_ROOT", str(tmp_path / "models"))
+        registry, metadata = self._make_registry(tmp_path)
+        artifact = registry.artifact_path(metadata.version)
+        artifact.write_bytes(artifact.read_bytes() + b"tampered")
+
+        client = TestClient(app)
+        resp = client.get("/model/current")
+        assert resp.status_code == 200
+        assert resp.json()["verified"] is False
+
+
+# ---------------------------------------------------------------------------
 # POST /trigger/{ticker}
 # ---------------------------------------------------------------------------
 
@@ -416,6 +580,7 @@ class TestTrigger:
         # Ensure AIRFLOW_API_URL is not set
         with patch.dict("os.environ", {}, clear=False):
             import os
+
             os.environ.pop("AIRFLOW_API_URL", None)
             resp = client.post("/trigger/AAPL")
         assert resp.status_code == 202
@@ -425,6 +590,7 @@ class TestTrigger:
         cache = _mock_cache(get_cik="320193")
         client = _override(db=db, cache=cache)
         import os
+
         os.environ.pop("AIRFLOW_API_URL", None)
         body = client.post("/trigger/AAPL").json()
         assert body["status"] == "queued"
@@ -436,6 +602,7 @@ class TestTrigger:
         cache = _mock_cache(get_cik=None)
         client = _override(db=db, cache=cache)
         import os
+
         os.environ.pop("AIRFLOW_API_URL", None)
         resp = client.post("/trigger/NEWCO")
         assert resp.status_code == 202
@@ -463,6 +630,8 @@ class TestOpenAPISchema:
         assert "/filings/{ticker}" in paths
         assert "/filing/{accession}" in paths
         assert "/facts/{ticker}/{fact_name}" in paths
+        assert "/anomalies/{ticker}" in paths
+        assert "/model/current" in paths
         assert "/trigger/{ticker}" in paths
 
     def test_all_endpoints_have_summaries(self):
