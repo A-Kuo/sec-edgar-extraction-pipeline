@@ -254,11 +254,12 @@ Filing and fact reads check Redis before PostgreSQL. `/anomalies` and `/model/cu
 When handing this project to another contributor or agent, update this section:
 
 **Last updated:** August 2026
-**Current state:** Core pipeline, ML anomaly-detection layer, model registry, and CI/CD (lint/typecheck/test/DAG-import/migrations, model train+gate, Docker build+push) are all implemented and passing. 363 tests, 77% coverage on the CI-gated modules.
+**Current state:** Core pipeline, ML anomaly-detection layer, model registry, idempotent DB writes (`src/upsert.py`), jittered retry backoff, and CI/CD (lint/typecheck/test/DAG-import/migrations, model train+gate, Docker build+push) are all implemented and passing. 408 tests, ~78% coverage on the CI-gated modules.
 
 **Next steps (not yet done):**
+- **Hash-chained, per-accession, DB-enforced immutable audit trail** — fully designed, not yet implemented. See [`docs/AUDIT_TRAIL_PLAN.md`](docs/AUDIT_TRAIL_PLAN.md) for the complete schema, hash-chain design, PostgreSQL trigger SQL, DAG wiring points, API/CLI additions, and suggested PR sequencing. `pipeline_audit` today is append-only by *code convention* only (nothing enforces it at the DB level) and is stage-level, not per-accession — this closes both gaps.
 - Production deployment guide beyond the container image (no Kubernetes/Helm config exists yet)
-- HashiCorp Vault / cloud secrets manager integration (currently plain environment variables)
+- HashiCorp Vault / cloud secrets manager integration (currently plain environment variables) — also the real `system_id` source the audit-trail plan above needs
 - A labelled (not just synthetic-corruption) evaluation set for the anomaly detector, once enough real flagged filings have been reviewed to build one
 
 ## Resources
