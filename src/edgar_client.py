@@ -1,5 +1,6 @@
 """
-SEC EDGAR API client with token-bucket rate limiting and exponential backoff.
+SEC EDGAR API client with token-bucket rate limiting and exponential
+backoff with full jitter.
 
 Rate limit: 10 requests/second (SEC policy).
 User-Agent is required by the SEC; omitting it causes 403s.
@@ -8,6 +9,7 @@ User-Agent is required by the SEC; omitting it causes 403s.
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 from typing import Any
@@ -29,6 +31,14 @@ SEARCH_URL = "https://efts.sec.gov/LATEST/search-index"
 DEFAULT_USER_AGENT = "SEC-EDGAR-Pipeline aus.kuo03@gmail.com"
 MAX_RETRIES = 5
 RATE_LIMIT_RPS = 10  # requests per second
+BACKOFF_CAP_SECONDS = 60.0
+
+# Small jitter added on top of a server-supplied Retry-After value. Retry-After
+# is a floor the server actually asked for, so it is honored, not randomized
+# away — but many workers all waking at t + Retry-After exactly still
+# resynchronizes them into the next lockstep wave. A few seconds of jitter on
+# top breaks that up without meaningfully violating what the server asked for.
+RETRY_AFTER_JITTER_SECONDS = 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +76,44 @@ class _TokenBucket:
 
 
 # ---------------------------------------------------------------------------
+# Backoff with full jitter
+# ---------------------------------------------------------------------------
+
+
+def full_jitter_backoff(
+    attempt: int,
+    *,
+    base: float = 1.0,
+    cap: float = BACKOFF_CAP_SECONDS,
+    rand: random.Random | None = None,
+) -> float:
+    """
+    "Full jitter" exponential backoff (AWS Architecture Blog, 2015):
+    ``sleep = uniform(0, min(cap, base * 2**attempt))``.
+
+    A deterministic exponential curve is the *cause* of the failure mode it is
+    meant to prevent: every client hitting the same rate limit at the same
+    moment computes the same delay and retries in lockstep, producing a
+    synchronized wave against an endpoint that just told everyone to back off.
+    Drawing the actual sleep uniformly from ``[0, ceiling]`` spreads retries
+    across the whole window instead, which is what actually protects a
+    shared, sensitive endpoint like SEC EDGAR from a retry storm.
+
+    Args:
+        attempt: 0-indexed retry attempt number.
+        base:    Base delay in seconds before jitter (default 1.0).
+        cap:     Maximum ceiling in seconds, before jitter is applied.
+        rand:    Injectable ``random.Random`` for deterministic tests;
+                 defaults to the module-level ``random`` functions.
+
+    Returns:
+        Seconds to sleep, in ``[0, cap]``.
+    """
+    ceiling = min(cap, base * (2**attempt))
+    return rand.uniform(0, ceiling) if rand is not None else random.uniform(0, ceiling)
+
+
+# ---------------------------------------------------------------------------
 # EdgarClient
 # ---------------------------------------------------------------------------
 
@@ -98,8 +146,13 @@ class EdgarClient:
         """
         Make a GET request, respecting the rate limit and retrying on
         transient errors (429 Too Many Requests, 503 Service Unavailable).
+
+        Retries use full-jitter exponential backoff (see
+        ``full_jitter_backoff``), not a bare ``time.sleep(backoff)`` — a
+        deterministic curve means every worker that hits a rate limit at the
+        same moment retries in lockstep, which is itself a self-inflicted
+        rate-limit-ban risk against a shared endpoint.
         """
-        backoff = 1.0
         last_exc: Exception | None = None
 
         for attempt in range(self._max_retries + 1):
@@ -112,22 +165,30 @@ class EdgarClient:
                     "Request error (attempt %d/%d): %s", attempt + 1, self._max_retries + 1, exc
                 )
                 if attempt < self._max_retries:
-                    time.sleep(backoff)
-                    backoff = min(backoff * 2, 60)
+                    wait = full_jitter_backoff(attempt)
+                    logger.debug("Backing off %.2fs before retry", wait)
+                    time.sleep(wait)
                 continue
 
             if resp.status_code in (429, 503):
-                retry_after = float(resp.headers.get("Retry-After", backoff))
+                header_value = resp.headers.get("Retry-After")
+                if header_value is not None:
+                    # The server told us explicitly how long to wait — honor
+                    # that as a floor, and add a small jitter on top so many
+                    # workers given the identical Retry-After don't all wake
+                    # and retry at exactly the same instant.
+                    wait = float(header_value) + random.uniform(0, RETRY_AFTER_JITTER_SECONDS)
+                else:
+                    wait = full_jitter_backoff(attempt)
                 logger.warning(
                     "HTTP %d — waiting %.1fs before retry (attempt %d/%d)",
                     resp.status_code,
-                    retry_after,
+                    wait,
                     attempt + 1,
                     self._max_retries + 1,
                 )
                 if attempt < self._max_retries:
-                    time.sleep(retry_after)
-                    backoff = min(backoff * 2, 60)
+                    time.sleep(wait)
                 continue
 
             resp.raise_for_status()
