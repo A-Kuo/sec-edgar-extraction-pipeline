@@ -8,6 +8,8 @@ Architecture spec and build notes for contributors (human or AI) working on this
 
 **Status:** Core pipeline (EDGAR client, XBRL parser, schema + migrations, quality checks, Redis cache, Airflow DAG, FastAPI layer) plus an anomaly-detection layer (`src/ml/`), a model registry, CI/CD workflows, and a Docker image are all in place. See [README.md](README.md) for setup and usage.
 
+For *why* the system looks the way it does — real defects found and corrected, with commit hashes and measured before/after, not just the finished state — see [`docs/DECISION_LOG.md`](docs/DECISION_LOG.md).
+
 ## Repository Structure
 
 ```
@@ -261,6 +263,11 @@ When handing this project to another contributor or agent, update this section:
 - Production deployment guide beyond the container image (no Kubernetes/Helm config exists yet)
 - HashiCorp Vault / cloud secrets manager integration (currently plain environment variables) — also the real `system_id` source the audit-trail plan above needs
 - A labelled (not just synthetic-corruption) evaluation set for the anomaly detector, once enough real flagged filings have been reviewed to build one
+
+## Related Documents
+
+- [`docs/DECISION_LOG.md`](docs/DECISION_LOG.md) — real engineering decisions with evidence: defects found and corrected (commit hashes, before/after metrics, the test that proves each fix), and the architecture choices made deliberately from the outset.
+- [`docs/AUDIT_TRAIL_PLAN.md`](docs/AUDIT_TRAIL_PLAN.md) — full design for the not-yet-implemented immutable audit trail (§9 of the decision log explains why it's a plan and not a diff).
 
 ## Resources
 

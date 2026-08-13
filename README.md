@@ -258,6 +258,8 @@ See [`.env.example`](.env.example) for the full list with inline comments.
 
 ## Key Design Decisions
 
+The bullets below state conclusions. [`docs/DECISION_LOG.md`](docs/DECISION_LOG.md) shows the work behind them — the specific defects each decision corrects, with commit hashes and measured before/after — plus the architecture choices made deliberately from day one rather than arrived at by correcting a mistake.
+
 - **No LLM in the extraction path.** XBRL parsing is deterministic (`lxml`), so extraction is reproducible, auditable, and carries no hallucination risk. The anomaly model is downstream of extraction — it scores facts, it never produces them.
 - **Hybrid anomaly detection, not just a model.** An IsolationForest alone measured 0.17 recall on dropped required facts, because that feature has zero variance in training and gets flattened by standardization before any tree sees it. Deterministic plausibility rules (`src/ml/rules.py`) catch the failure modes worth naming explicitly; the forest catches what nobody thought to write a rule for. A filing's score is `max(model_score, rule_score)`, with the specific rule violations attached — a review queue an analyst can act on, not a number they have to trust blindly.
 - **A verified, versioned model registry.** Every model version's artifact hash, training-data hash, git commit, and evaluation metrics are recorded at registration; `verify()` re-hashes the artifact before every load, so a model swapped on disk after registration fails to load rather than silently scoring production traffic.
