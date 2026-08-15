@@ -268,6 +268,7 @@ When handing this project to another contributor or agent, update this section:
 
 - [`docs/DECISION_LOG.md`](docs/DECISION_LOG.md) — real engineering decisions with evidence: defects found and corrected (commit hashes, before/after metrics, the test that proves each fix), and the architecture choices made deliberately from the outset.
 - [`docs/AUDIT_TRAIL_PLAN.md`](docs/AUDIT_TRAIL_PLAN.md) — full design for the not-yet-implemented immutable audit trail (§9 of the decision log explains why it's a plan and not a diff).
+- [`docs/MICROSERVICE_ALTERNATIVE.md`](docs/MICROSERVICE_ALTERNATIVE.md) — a labeled, never-built comparative design: what a microservice decomposition of this system would look like, and why the monolith was chosen instead, argued from this project's own documented defects rather than general architecture-blog wisdom.
 
 ## Resources
 

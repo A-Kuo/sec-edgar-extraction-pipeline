@@ -66,6 +66,16 @@ directly, and could be split into its own deployment without touching the
 extraction path at all. Not needed today; not designed around a hypothetical
 need either.
 
+**The alternative, sketched out rather than asserted:**
+[`docs/MICROSERVICE_ALTERNATIVE.md`](MICROSERVICE_ALTERNATIVE.md) works
+through what a microservice decomposition of this same system would
+actually look like — service boundaries, data ownership, API contracts, a
+deployment sketch — and argues the rejection using the specific defects in
+§1–9 below as evidence, rather than general monolith-vs-microservice
+talking points. It also names the one place a service split would be a
+genuine improvement (isolating the audit trail's write credentials), so the
+rejection of the rest is a comparison, not a dismissal.
+
 ---
 
 ## §1. Airflow 3 incompatibility hidden by a false-green test suite
