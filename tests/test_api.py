@@ -565,6 +565,116 @@ class TestModelInfo:
 
 
 # ---------------------------------------------------------------------------
+# GET /audit/{accession}
+#
+# Backed by a real SQLite session (schema created via Base.metadata.create_all,
+# rows written via src.audit.write_extraction_audit) rather than a MagicMock —
+# this endpoint reads via a raw text() query, and a MagicMock would only prove
+# the endpoint calls .execute() with something, not that the response actually
+# round-trips real column types (in particular created_at) through Pydantic.
+# ---------------------------------------------------------------------------
+
+
+class TestAccessionAudit:
+    def setup_method(self):
+        _clear_overrides()
+
+    def _seeded_session(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session as RealSession
+        from sqlalchemy.pool import StaticPool
+
+        from src.audit import write_extraction_audit
+        from src.schema import Base
+
+        # StaticPool + check_same_thread=False: a plain in-memory SQLite URL
+        # gives each new connection a *fresh* empty database, and the default
+        # pool would hand out a fresh connection per checkout — the schema
+        # created below would vanish before the endpoint's own query ran.
+        # TestClient also dispatches the request handler onto a different
+        # thread than this one, which check_same_thread=False permits.
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(engine)
+        session = RealSession(engine)
+        write_extraction_audit(
+            session,
+            run_id="run-1",
+            stage="download",
+            extraction_status="success",
+            accession_number="A",
+        )
+        write_extraction_audit(
+            session,
+            run_id="run-1",
+            stage="parse",
+            extraction_status="failure",
+            accession_number="A",
+            detail="malformed XBRL",
+        )
+        write_extraction_audit(
+            session,
+            run_id="run-1",
+            stage="download",
+            extraction_status="success",
+            accession_number="B",
+        )
+        session.commit()
+        return session
+
+    def test_returns_200_with_history(self):
+        cache = _mock_cache()
+        client = _override(db=self._seeded_session(), cache=cache)
+        resp = client.get("/audit/A")
+        assert resp.status_code == 200
+
+    def test_only_the_requested_accessions_rows_are_returned(self):
+        cache = _mock_cache()
+        client = _override(db=self._seeded_session(), cache=cache)
+        body = client.get("/audit/A").json()
+        assert body["accession_number"] == "A"
+        assert body["total"] == 2
+        assert all(item["run_id"] == "run-1" for item in body["items"])
+
+    def test_newest_first(self):
+        cache = _mock_cache()
+        client = _override(db=self._seeded_session(), cache=cache)
+        body = client.get("/audit/A").json()
+        assert body["items"][0]["stage"] == "parse"
+        assert body["items"][1]["stage"] == "download"
+
+    def test_rows_carry_the_hash_chain_fields(self):
+        cache = _mock_cache()
+        client = _override(db=self._seeded_session(), cache=cache)
+        item = client.get("/audit/A").json()["items"][0]
+        assert len(item["row_hash"]) == 64
+        assert item["prev_row_hash"] is not None  # second row written, chained to the first
+
+    def test_failure_row_carries_its_detail(self):
+        cache = _mock_cache()
+        client = _override(db=self._seeded_session(), cache=cache)
+        parse_row = next(i for i in client.get("/audit/A").json()["items"] if i["stage"] == "parse")
+        assert parse_row["extraction_status"] == "failure"
+        assert parse_row["detail"] == "malformed XBRL"
+
+    def test_404_for_an_accession_with_no_audit_history(self):
+        cache = _mock_cache()
+        client = _override(db=self._seeded_session(), cache=cache)
+        resp = client.get("/audit/NEVER-SEEN")
+        assert resp.status_code == 404
+
+    def test_does_not_leak_another_accessions_rows(self):
+        cache = _mock_cache()
+        client = _override(db=self._seeded_session(), cache=cache)
+        body = client.get("/audit/B").json()
+        assert body["total"] == 1
+        assert body["items"][0]["stage"] == "download"
+
+
+# ---------------------------------------------------------------------------
 # POST /trigger/{ticker}
 # ---------------------------------------------------------------------------
 
@@ -632,6 +742,7 @@ class TestOpenAPISchema:
         assert "/facts/{ticker}/{fact_name}" in paths
         assert "/anomalies/{ticker}" in paths
         assert "/model/current" in paths
+        assert "/audit/{accession}" in paths
         assert "/trigger/{ticker}" in paths
 
     def test_all_endpoints_have_summaries(self):

@@ -9,12 +9,14 @@ Endpoints
   GET  /facts/{ticker}/{fact_name}  time-series of a specific fact
   GET  /anomalies/{ticker}          anomaly scores + reasons for a ticker
   GET  /model/current               provenance of the promoted anomaly model
+  GET  /audit/{accession}           hash-chained extraction audit history
   POST /trigger/{ticker}            trigger on-demand ingestion
 
 Fact and filing reads check Redis before hitting PostgreSQL; cache misses
-populate Redis so subsequent calls are served from memory. The anomaly and
-model endpoints deliberately bypass the cache — scores change whenever a new
-model is promoted, and serving a stale score is worse than serving a slow one.
+populate Redis so subsequent calls are served from memory. The anomaly,
+model, and audit endpoints deliberately bypass the cache — scores and audit
+records change independently of the cache's TTLs, and serving a stale answer
+is worse than serving a slow one, especially for the audit trail.
 
 Run with:
     uvicorn api.main:app --reload
@@ -207,6 +209,27 @@ class ModelInfoResponse(BaseModel):
     feature_names: list[str]
     metrics: dict[str, float]
     verified: bool
+
+
+class ExtractionAuditRow(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    run_id: str
+    system_id: str
+    stage: str
+    extraction_status: str
+    detail: str | None
+    content_hash: str | None
+    row_hash: str
+    prev_row_hash: str | None
+    created_at: datetime
+
+
+class AccessionAuditResponse(BaseModel):
+    accession_number: str
+    total: int
+    items: list[ExtractionAuditRow]
 
 
 # ---------------------------------------------------------------------------
@@ -681,6 +704,80 @@ def model_info() -> ModelInfoResponse:
         feature_names=metadata.feature_names,
         metrics=metadata.metrics,
         verified=verified,
+    )
+
+
+@app.get(
+    "/audit/{accession}",
+    response_model=AccessionAuditResponse,
+    summary="Extraction audit history for one filing",
+    description=(
+        "Returns every recorded extraction-audit event for one accession "
+        "number — one row per stage per attempt (download/parse/load), "
+        "newest first — each carrying the system that ran it, the outcome, "
+        "and a hash chained to the row written immediately before it. This "
+        "is what answers a regulator's 'where did this number come from, "
+        "and prove it' in a single query instead of a manual reconstruction. "
+        "Not cached — an audit trail serving a stale answer defeats its "
+        "purpose. Chain integrity is checked separately: see "
+        "`scripts/verify_audit_chain.py`, since verifying the WHOLE chain "
+        "on every request to this endpoint would be needlessly expensive "
+        "for what is fundamentally a read of one accession's history."
+    ),
+    tags=["audit"],
+)
+def get_accession_audit(
+    accession: str,
+    db: DBDep,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+) -> AccessionAuditResponse:
+    rows = db.execute(
+        text(
+            """
+            SELECT id, run_id, system_id, stage, extraction_status, detail,
+                   content_hash, row_hash, prev_row_hash, created_at
+            FROM extraction_audit
+            WHERE accession_number = :accession
+            ORDER BY id DESC
+            LIMIT :limit
+            """
+        ),
+        {"accession": accession, "limit": limit},
+    ).fetchall()
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No extraction_audit records found for accession '{accession}'. "
+                "Either it hasn't been processed yet, or the audit trail feature "
+                "(dags/edgar_pipeline.py's per-stage writes) predates this filing."
+            ),
+        )
+
+    total = db.execute(
+        text("SELECT COUNT(*) FROM extraction_audit WHERE accession_number = :accession"),
+        {"accession": accession},
+    ).scalar_one()
+
+    return AccessionAuditResponse(
+        accession_number=accession,
+        total=int(total),
+        items=[
+            ExtractionAuditRow(
+                id=r[0],
+                run_id=r[1],
+                system_id=r[2],
+                stage=r[3],
+                extraction_status=r[4],
+                detail=r[5],
+                content_hash=r[6],
+                row_hash=r[7],
+                prev_row_hash=r[8],
+                created_at=r[9],
+            )
+            for r in rows
+        ],
     )
 
 

@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from src.schema import (
     Base,
+    ExtractionAudit,
     FactAnomaly,
     FilingRaw,
     FilingVersion,
@@ -162,6 +163,83 @@ class TestPipelineAudit:
         assert "parse" in repr(audit)
 
 
+class TestExtractionAudit:
+    def test_insert_a_chained_row(self, session):
+        session.add(
+            ExtractionAudit(
+                run_id="run-1",
+                system_id="sys-1",
+                accession_number="A",
+                stage="download",
+                extraction_status="success",
+                row_hash="h" * 64,
+            )
+        )
+        session.commit()
+
+        row = session.query(ExtractionAudit).one()
+        assert row.extraction_status == "success"
+        assert row.prev_row_hash is None
+        assert row.created_at is not None
+
+    def test_row_hash_is_required(self, session):
+        session.add(
+            ExtractionAudit(
+                run_id="run-1",
+                system_id="sys-1",
+                stage="download",
+                extraction_status="success",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+    def test_accession_number_is_optional(self, session):
+        """A batch-level failure (e.g. the fetch itself failed) has no
+        accession yet — the column must not require one."""
+        session.add(
+            ExtractionAudit(
+                run_id="run-1",
+                system_id="sys-1",
+                stage="download",
+                extraction_status="failure",
+                detail="SEC EDGAR unreachable",
+                row_hash="h" * 64,
+            )
+        )
+        session.commit()  # must not raise
+        assert session.query(ExtractionAudit).one().accession_number is None
+
+    def test_accession_number_is_not_a_foreign_key(self, session):
+        """Deliberate: must be able to log a failed attempt for an
+        accession that never landed in filings_raw at all — see the
+        rationale in ExtractionAudit's docstring."""
+        session.add(
+            ExtractionAudit(
+                run_id="run-1",
+                system_id="sys-1",
+                accession_number="never-landed",
+                stage="download",
+                extraction_status="failure",
+                row_hash="h" * 64,
+            )
+        )
+        session.commit()  # must not raise a FK violation
+
+    def test_repr_includes_accession_and_stage(self):
+        audit = ExtractionAudit(
+            run_id="run-1",
+            system_id="sys-1",
+            accession_number="A",
+            stage="parse",
+            extraction_status="success",
+            row_hash="h" * 64,
+        )
+        assert "A" in repr(audit)
+        assert "parse" in repr(audit)
+
+
 class TestModelRunAndFactAnomaly:
     def test_model_run_and_anomalies_relationship(self, session):
         filing = FilingRaw(
@@ -279,6 +357,7 @@ def test_all_tables_registered_on_base_metadata():
         "financial_facts",
         "filing_versions",
         "pipeline_audit",
+        "extraction_audit",
         "model_runs",
         "fact_anomalies",
     }

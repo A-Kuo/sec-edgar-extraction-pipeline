@@ -177,6 +177,41 @@ def _write_audit(run_id: str, stage: str, status: str, records: int, error: str 
         )
 
 
+def _write_extraction_audit(
+    run_id: str, stage: str, outcomes: dict[str, tuple[str, str | None, str | None]]
+) -> None:
+    """
+    Write one hash-chained ``extraction_audit`` row per accession for *stage*.
+
+    ``outcomes`` maps ``accession_number -> (extraction_status, detail,
+    content_hash)``. See ``src.audit`` for the hash chain itself; this is
+    just the DAG-side call site, mirroring ``_write_audit`` above for
+    ``pipeline_audit``.
+
+    Deliberately not wrapped to swallow failures: ``_write_audit`` above
+    isn't either, so a broken connection already fails ``pipeline_audit``
+    writes loudly today. An audit trail that silently fails to record
+    itself — rather than failing the task and surfacing the problem — would
+    be worse than no audit trail at all, since it would look present while
+    quietly not being one. Contrast with ``score_anomalies``, which *is*
+    deliberately non-blocking: a missed anomaly score is a missed
+    convenience, a missed audit record is the actual compliance gap this
+    feature exists to close.
+    """
+    if not outcomes:
+        return
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    from src.audit import write_extraction_audit_batch
+
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    with Session(engine) as session:
+        write_extraction_audit_batch(session, run_id=run_id, stage=stage, outcomes=outcomes)
+        session.commit()
+
+
 # ---------------------------------------------------------------------------
 # Task callables
 # ---------------------------------------------------------------------------
@@ -249,19 +284,26 @@ def download_raw_documents(**context: Any) -> list[str]:
             downloaded = [f["accession_number"] for f in filings]
             logger.info("[MOCK] downloaded %d documents", len(downloaded))
         else:
+            from src.audit import compute_content_hash
             from src.edgar_client import EdgarClient
 
             client = EdgarClient()
+            audit_outcomes: dict[str, tuple[str, str | None, str | None]] = {}
             for filing in filings:
+                accession = filing["accession_number"]
                 try:
                     html = client.get_filing_document(
                         f"https://www.sec.gov/Archives/edgar/data/"
-                        f"{filing['cik']}/{filing['accession_number'].replace('-', '')}/"
+                        f"{filing['cik']}/{accession.replace('-', '')}/"
                     )
                     _persist_raw_filing(filing, html, run_id)
-                    downloaded.append(filing["accession_number"])
+                    downloaded.append(accession)
+                    audit_outcomes[accession] = ("success", None, compute_content_hash(html))
                 except Exception as exc:
-                    logger.warning("Failed to download %s: %s", filing["accession_number"], exc)
+                    logger.warning("Failed to download %s: %s", accession, exc)
+                    audit_outcomes[accession] = ("failure", str(exc), None)
+
+            _write_extraction_audit(run_id, "download", audit_outcomes)
 
         _audit_complete(run_id, "ingest", len(downloaded))
         context["ti"].xcom_push(key="downloaded_accessions", value=downloaded)
@@ -275,6 +317,14 @@ def download_raw_documents(**context: Any) -> list[str]:
 def parse_xbrl_facts(**context: Any) -> list[dict]:
     """
     Stage 3 — Parse XBRL facts from downloaded HTML and store in financial_facts.
+
+    Each filing is parsed in its own try/except, matching the isolation
+    ``download_raw_documents`` already applies per-filing: one malformed
+    filing must not abort parsing for every other filing in the same batch.
+    This is a deliberate change from a bare per-accession loop with no error
+    isolation, made safe *because* every skipped filing is now recorded in
+    ``extraction_audit`` — swallowing a per-filing failure silently would
+    have been the wrong trade; recording it is not.
     """
     run_id: str = context["run_id"]
     accessions: list[str] = context["ti"].xcom_pull(
@@ -293,9 +343,17 @@ def parse_xbrl_facts(**context: Any) -> list[dict]:
 
             parser = XBRLParser()
             raw_html_map = _load_raw_html(accessions)
+            audit_outcomes: dict[str, tuple[str, str | None, str | None]] = {}
             for accession, html in raw_html_map.items():
-                rows = parser.parse(html, accession)
-                all_facts.extend(r.as_dict() for r in rows)
+                try:
+                    rows = parser.parse(html, accession)
+                    all_facts.extend(r.as_dict() for r in rows)
+                    audit_outcomes[accession] = ("success", None, None)
+                except Exception as exc:
+                    logger.warning("Failed to parse %s: %s", accession, exc)
+                    audit_outcomes[accession] = ("failure", str(exc), None)
+
+            _write_extraction_audit(run_id, "parse", audit_outcomes)
 
         _audit_complete(run_id, "parse", len(all_facts))
         context["ti"].xcom_push(key="facts", value=all_facts)
@@ -490,6 +548,15 @@ def load_to_warehouse(**context: Any) -> int:
     Stage 6 — Idempotently upsert parsed facts into the PostgreSQL warehouse.
 
     Returns the number of rows inserted.
+
+    ``_bulk_insert_facts`` upserts the whole batch as one atomic statement
+    (see ``src/upsert.py``): it either lands every fact in *facts* or raises
+    and lands none of them. The ``extraction_audit`` outcome for this stage
+    follows that same all-or-nothing shape — one "success" row per accession
+    in the batch when it commits, one "failure" row per accession (all
+    referencing the same underlying error) if it doesn't — rather than
+    guessing at a per-accession result the underlying operation doesn't
+    actually produce.
     """
     run_id: str = context["run_id"]
     facts: list[dict] = context["ti"].xcom_pull(key="facts", task_ids="parse_xbrl_facts")
@@ -501,13 +568,26 @@ def load_to_warehouse(**context: Any) -> int:
             logger.info("[MOCK] loaded %d rows to warehouse", loaded)
         else:
             loaded = _bulk_insert_facts(facts or [])
+            _write_extraction_audit(run_id, "load", _load_audit_outcomes(facts or [], "success"))
 
         _audit_complete(run_id, "load", loaded)
         return loaded
 
     except Exception as exc:
+        if not MOCK_EDGAR:
+            _write_extraction_audit(
+                run_id, "load", _load_audit_outcomes(facts or [], "failure", str(exc))
+            )
         _audit_failed(run_id, "load", str(exc))
         raise
+
+
+def _load_audit_outcomes(
+    facts: list[dict], status: str, detail: str | None = None
+) -> dict[str, tuple[str, str | None, str | None]]:
+    """Build the per-accession outcomes map for a load-stage audit write."""
+    accessions = sorted({f["accession_number"] for f in facts if f.get("accession_number")})
+    return dict.fromkeys(accessions, (status, detail, None))
 
 
 def update_audit_trail(**context: Any) -> None:

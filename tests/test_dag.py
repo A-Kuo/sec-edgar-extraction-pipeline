@@ -358,7 +358,127 @@ class TestTaskCallablesInMockMode:
 
 
 # ---------------------------------------------------------------------------
-# 4. Mock fixture integrity
+# 4. Extraction audit wiring (real SQLite DB, not the mocked-Airflow path)
+#
+# _write_extraction_audit and _load_audit_outcomes are plain functions that
+# open their own SQLAlchemy engine from dag_module.DATABASE_URL — they don't
+# touch Airflow at all, so they're testable directly against a real (file-
+# backed, so it persists across the module's own separate engine/session)
+# SQLite database rather than through the mocked-Airflow context used above.
+# ---------------------------------------------------------------------------
+
+
+class TestExtractionAuditWiring:
+    @pytest.fixture
+    def audit_db(self, tmp_path, monkeypatch):
+        """A real file-backed SQLite DB with the schema created, wired in
+        as dag_module.DATABASE_URL for the duration of the test."""
+        from sqlalchemy import create_engine
+
+        from src.schema import Base
+
+        db_path = tmp_path / "audit_test.db"
+        db_url = f"sqlite:///{db_path}"
+        Base.metadata.create_all(create_engine(db_url))
+        monkeypatch.setattr(dag_module, "DATABASE_URL", db_url)
+        return db_url
+
+    def _read_rows(self, db_url):
+        from sqlalchemy import create_engine, select
+        from sqlalchemy.orm import Session
+
+        from src.schema import ExtractionAudit
+
+        with Session(create_engine(db_url)) as session:
+            return session.scalars(select(ExtractionAudit).order_by(ExtractionAudit.id)).all()
+
+    def test_writes_one_row_per_accession(self, audit_db):
+        dag_module._write_extraction_audit(
+            "run-1",
+            "download",
+            {
+                "A": ("success", None, "c" * 64),
+                "B": ("failure", "timed out", None),
+            },
+        )
+        rows = self._read_rows(audit_db)
+        assert len(rows) == 2
+        by_accession = {r.accession_number: r for r in rows}
+        assert by_accession["A"].extraction_status == "success"
+        assert by_accession["A"].content_hash == "c" * 64
+        assert by_accession["B"].extraction_status == "failure"
+        assert by_accession["B"].detail == "timed out"
+
+    def test_rows_are_hash_chained(self, audit_db):
+        dag_module._write_extraction_audit(
+            "run-1", "download", {"A": ("success", None, None), "B": ("success", None, None)}
+        )
+        rows = self._read_rows(audit_db)
+        assert rows[1].prev_row_hash == rows[0].row_hash
+
+    def test_chain_across_stages_verifies(self, audit_db):
+        """download then parse then load, in separate calls (as the DAG
+        actually makes them) — the chain must span all of them cleanly."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
+
+        from src.audit import verify_chain
+
+        dag_module._write_extraction_audit("run-1", "download", {"A": ("success", None, None)})
+        dag_module._write_extraction_audit("run-1", "parse", {"A": ("success", None, None)})
+        dag_module._write_extraction_audit("run-1", "load", {"A": ("success", None, None)})
+
+        with Session(create_engine(audit_db)) as session:
+            result = verify_chain(session)
+        assert result.valid
+        assert result.total_rows == 3
+
+    def test_empty_outcomes_writes_nothing_and_does_not_raise(self, audit_db):
+        dag_module._write_extraction_audit("run-1", "download", {})
+        assert self._read_rows(audit_db) == []
+
+    def test_a_broken_write_propagates_rather_than_being_swallowed(self, monkeypatch, audit_db):
+        """Unlike score_anomalies, an audit-write failure must fail the
+        calling task — see the rationale in _write_extraction_audit's
+        docstring. Simulated here by pointing at a DB with no schema."""
+        from sqlalchemy.exc import OperationalError
+
+        monkeypatch.setattr(dag_module, "DATABASE_URL", "sqlite:///:memory:")
+        with pytest.raises(OperationalError):  # no such table
+            dag_module._write_extraction_audit("run-1", "download", {"A": ("success", None, None)})
+
+
+class TestLoadAuditOutcomes:
+    def test_maps_each_accession_to_the_given_status(self):
+        facts = [
+            {"accession_number": "A", "fact_name": "us-gaap:Revenues"},
+            {"accession_number": "B", "fact_name": "us-gaap:Assets"},
+        ]
+        outcomes = dag_module._load_audit_outcomes(facts, "success")
+        assert outcomes == {"A": ("success", None, None), "B": ("success", None, None)}
+
+    def test_deduplicates_accessions_from_multiple_fact_rows(self):
+        facts = [
+            {"accession_number": "A", "fact_name": "us-gaap:Revenues"},
+            {"accession_number": "A", "fact_name": "us-gaap:Assets"},
+        ]
+        assert dag_module._load_audit_outcomes(facts, "success") == {"A": ("success", None, None)}
+
+    def test_carries_the_detail_message_on_failure(self):
+        facts = [{"accession_number": "A", "fact_name": "us-gaap:Revenues"}]
+        outcomes = dag_module._load_audit_outcomes(facts, "failure", "db unavailable")
+        assert outcomes == {"A": ("failure", "db unavailable", None)}
+
+    def test_empty_facts_yields_empty_outcomes(self):
+        assert dag_module._load_audit_outcomes([], "success") == {}
+
+    def test_facts_missing_accession_number_are_skipped(self):
+        facts = [{"fact_name": "us-gaap:Revenues"}]
+        assert dag_module._load_audit_outcomes(facts, "success") == {}
+
+
+# ---------------------------------------------------------------------------
+# 5. Mock fixture integrity
 # ---------------------------------------------------------------------------
 
 

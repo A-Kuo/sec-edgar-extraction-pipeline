@@ -153,6 +153,7 @@ jobs:
           expected = {
               "filings_raw", "financial_facts", "filing_versions",
               "pipeline_audit", "model_runs", "fact_anomalies",
+              "extraction_audit",
           }
           inspector = inspect(create_engine(os.environ["DATABASE_URL"]))
           actual = set(inspector.get_table_names())
@@ -172,6 +173,70 @@ jobs:
           # from the deployed schema. Autogenerate against the migrated
           # database and fail if it finds anything left to do.
           alembic check
+
+      - name: Verify audit tables are append-only (Postgres trigger)
+        run: |
+          # migration 2cf6396ba519 installs a BEFORE UPDATE OR DELETE trigger
+          # on pipeline_audit and extraction_audit, but only on PostgreSQL —
+          # SQLite (used everywhere else in the test suite) silently skips it,
+          # so this is the only place the trigger itself is ever exercised.
+          python - <<'PY'
+          import os
+
+          from sqlalchemy import create_engine, text
+
+          engine = create_engine(os.environ["DATABASE_URL"])
+
+          def assert_append_only(table: str, insert_sql: str, params: dict) -> None:
+              with engine.begin() as conn:
+                  row_id = conn.execute(text(insert_sql), params).scalar_one()
+
+              with engine.connect() as conn:
+                  try:
+                      conn.execute(
+                          text(f"UPDATE {table} SET id = id WHERE id = :id"), {"id": row_id}
+                      )
+                      conn.commit()
+                  except Exception as exc:
+                      conn.rollback()
+                      assert "append-only" in str(exc), f"unexpected {table} UPDATE error: {exc}"
+                  else:
+                      raise AssertionError(f"{table} allowed an UPDATE — trigger did not fire")
+
+              with engine.connect() as conn:
+                  try:
+                      conn.execute(text(f"DELETE FROM {table} WHERE id = :id"), {"id": row_id})
+                      conn.commit()
+                  except Exception as exc:
+                      conn.rollback()
+                      assert "append-only" in str(exc), f"unexpected {table} DELETE error: {exc}"
+                  else:
+                      raise AssertionError(f"{table} allowed a DELETE — trigger did not fire")
+
+              print(f"{table}: UPDATE and DELETE both correctly rejected")
+
+          assert_append_only(
+              "pipeline_audit",
+              """INSERT INTO pipeline_audit (run_id, stage, status)
+                 VALUES (:run_id, :stage, :status) RETURNING id""",
+              {"run_id": "ci-trigger-check", "stage": "ingest", "status": "completed"},
+          )
+
+          assert_append_only(
+              "extraction_audit",
+              """INSERT INTO extraction_audit
+                     (run_id, system_id, stage, extraction_status, row_hash)
+                 VALUES (:run_id, :system_id, :stage, :extraction_status, :row_hash)
+                 RETURNING id""",
+              {
+                  "run_id": "ci-trigger-check",
+                  "system_id": "ci",
+                  "stage": "download",
+                  "extraction_status": "success",
+                  "row_hash": "0" * 64,
+              },
+          )
+          PY
 
       - name: Import the DAG against real Airflow
         run: pytest tests/test_dag_import.py -v

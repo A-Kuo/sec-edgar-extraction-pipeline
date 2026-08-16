@@ -6,6 +6,7 @@ Tables:
   financial_facts  — parsed fact rows referencing filings_raw
   filing_versions  — immutable version history tracking amendments
   pipeline_audit   — append-only stage-level audit trail
+  extraction_audit — hash-chained, per-accession audit trail (see src.audit)
   model_runs       — one row per scoring run, pinning the model version used
   fact_anomalies   — per-filing anomaly scores, joined back to model_runs
 """
@@ -166,6 +167,56 @@ class PipelineAudit(Base):
 
     def __repr__(self) -> str:
         return f"<PipelineAudit run={self.run_id} stage={self.stage} status={self.status}>"
+
+
+class ExtractionAudit(Base):
+    """
+    Per-accession, hash-chained extraction audit trail.
+
+    ``pipeline_audit`` above records one row per DAG *stage* per *run* — it
+    cannot answer "show every extraction attempt against accession X".  This
+    table can: one row per accession per stage per attempt, chained by
+    ``row_hash``/``prev_row_hash`` so that deleting, reordering, or altering
+    any row breaks every hash after it (see ``src.audit`` for the hash
+    construction and verification). On PostgreSQL this table additionally
+    has a trigger blocking ``UPDATE``/``DELETE`` outright (migration
+    ``2cf6396ba519``) — the hash chain plus the trigger together are what
+    make "immutable" a database guarantee here rather than an application
+    convention, closing the gap ``pipeline_audit`` alone left open.
+
+    ``accession_number`` is deliberately **not** a foreign key to
+    ``filings_raw``: this table must be able to record a *failed* extraction
+    attempt for an accession that never made it into ``filings_raw`` at all
+    (a corrupt download, a parse that raised before any row existed) — a FK
+    constraint would make exactly the failure case this table exists to
+    capture unrepresentable.
+    """
+
+    __tablename__ = "extraction_audit"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    system_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    accession_number: Mapped[str | None] = mapped_column(String(25), index=True)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)  # download | parse | load
+    extraction_status: Mapped[str] = mapped_column(
+        String(16), nullable=False
+    )  # success | failure | skipped
+    detail: Mapped[str | None] = mapped_column(Text)
+    content_hash: Mapped[str | None] = mapped_column(String(64))
+    prev_row_hash: Mapped[str | None] = mapped_column(String(64))
+    row_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ExtractionAudit accession={self.accession_number} stage={self.stage} "
+            f"status={self.extraction_status}>"
+        )
 
 
 class ModelRun(Base):
