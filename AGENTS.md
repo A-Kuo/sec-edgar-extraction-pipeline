@@ -98,7 +98,7 @@ CREATE TABLE filing_versions (
   recorded_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Audit trail (append-only — never UPDATE/DELETE)
+-- Stage-level audit trail (one row per DAG stage per run)
 CREATE TABLE pipeline_audit (
   id BIGSERIAL PRIMARY KEY,
   run_id TEXT NOT NULL,
@@ -106,6 +106,29 @@ CREATE TABLE pipeline_audit (
   status TEXT NOT NULL,               -- started | completed | failed
   records_processed INT,
   error_message TEXT,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Per-accession, hash-chained extraction audit trail (CMMC AU-2/AU-3/AU-12)
+-- Append-only, enforced at the DB level: a BEFORE UPDATE OR DELETE trigger
+-- (migration 2cf6396ba519, PostgreSQL only) rejects any mutation outright.
+-- Each row's row_hash covers its own fields plus the prior row's row_hash
+-- (src/audit.py::compute_row_hash), so tampering any historical row —
+-- including bypassing the trigger with superuser DDL — is detectable by
+-- recomputing the chain (scripts/verify_audit_chain.py). See
+-- docs/AUDIT_TRAIL_PLAN.md for the full design and what a hash chain does
+-- and does not prove.
+CREATE TABLE extraction_audit (
+  id BIGSERIAL PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  system_id TEXT NOT NULL,            -- which process/identity performed the extraction
+  accession_number TEXT,              -- nullable: failures can predate a row in filings_raw
+  stage TEXT NOT NULL,                -- download | parse | load
+  extraction_status TEXT NOT NULL,    -- success | failure
+  detail TEXT,
+  content_hash TEXT,                  -- SHA-256 of the extracted content, when applicable
+  prev_row_hash TEXT,                 -- NULL only for the chain's first row
+  row_hash TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
@@ -256,18 +279,18 @@ Filing and fact reads check Redis before PostgreSQL. `/anomalies` and `/model/cu
 When handing this project to another contributor or agent, update this section:
 
 **Last updated:** August 2026
-**Current state:** Core pipeline, ML anomaly-detection layer, model registry, idempotent DB writes (`src/upsert.py`), jittered retry backoff, and CI/CD (lint/typecheck/test/DAG-import/migrations, model train+gate, Docker build+push) are all implemented and passing. 408 tests, ~78% coverage on the CI-gated modules.
+**Current state:** Core pipeline, ML anomaly-detection layer, model registry, idempotent DB writes (`src/upsert.py`), jittered retry backoff, the hash-chained per-accession audit trail (`src/audit.py`, `extraction_audit`), and CI/CD (lint/typecheck/test/DAG-import/migrations/Postgres-trigger verification, model train+gate, Docker build+push) are all implemented and passing. 482 tests.
 
 **Next steps (not yet done):**
-- **Hash-chained, per-accession, DB-enforced immutable audit trail** — fully designed, not yet implemented. See [`docs/AUDIT_TRAIL_PLAN.md`](docs/AUDIT_TRAIL_PLAN.md) for the complete schema, hash-chain design, PostgreSQL trigger SQL, DAG wiring points, API/CLI additions, and suggested PR sequencing. `pipeline_audit` today is append-only by *code convention* only (nothing enforces it at the DB level) and is stage-level, not per-accession — this closes both gaps.
 - Production deployment guide beyond the container image (no Kubernetes/Helm config exists yet)
-- HashiCorp Vault / cloud secrets manager integration (currently plain environment variables) — also the real `system_id` source the audit-trail plan above needs
+- HashiCorp Vault / cloud secrets manager integration (currently plain environment variables) — also the real `system_id` source `src/audit.py::current_system_id()` should eventually read from instead of the `SYSTEM_ID` environment variable it falls back to today
 - A labelled (not just synthetic-corruption) evaluation set for the anomaly detector, once enough real flagged filings have been reviewed to build one
+- Whether `pipeline_audit` and `extraction_audit` should eventually merge into one table (see `docs/AUDIT_TRAIL_PLAN.md` §11) — left as two tables at different granularities for now, revisit only if it becomes a real pain point
 
 ## Related Documents
 
 - [`docs/DECISION_LOG.md`](docs/DECISION_LOG.md) — real engineering decisions with evidence: defects found and corrected (commit hashes, before/after metrics, the test that proves each fix), and the architecture choices made deliberately from the outset.
-- [`docs/AUDIT_TRAIL_PLAN.md`](docs/AUDIT_TRAIL_PLAN.md) — full design for the not-yet-implemented immutable audit trail (§9 of the decision log explains why it's a plan and not a diff).
+- [`docs/AUDIT_TRAIL_PLAN.md`](docs/AUDIT_TRAIL_PLAN.md) — the design rationale behind the implemented hash-chained audit trail: schema, hash-chain construction, PostgreSQL trigger, and what a hash chain does and doesn't prove (§9 of the decision log has what shipped and what changed from this plan during implementation).
 - [`docs/MICROSERVICE_ALTERNATIVE.md`](docs/MICROSERVICE_ALTERNATIVE.md) — a labeled, never-built comparative design: what a microservice decomposition of this system would look like, and why the monolith was chosen instead, argued from this project's own documented defects rather than general architecture-blog wisdom.
 
 ## Resources

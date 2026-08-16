@@ -19,8 +19,7 @@ within one Airflow-orchestrated deployable — not as independently deployed
 services. Rather than invent a correction that never happened, this log
 documents the architecture as what it actually was: a deliberate choice made
 up front, with reasoning (§0), sitting alongside the corrections that *did*
-happen (§1–8) and the one gap that was found and intentionally deferred
-(§9).
+happen (§1–9).
 
 Every commit hash below is verifiable with `git show <hash>` against this
 repository.
@@ -323,33 +322,68 @@ it, and the identical Python runs against PostgreSQL in production.
 
 ---
 
-## §9. Audit trail claimed "immutable" but enforced only by convention — found, designed, deliberately not rushed
+## §9. Audit trail claimed "immutable" but enforced only by convention — found, designed, then implemented
 
-**Status:** identified and fully designed; **not yet implemented**. See
-[`docs/AUDIT_TRAIL_PLAN.md`](AUDIT_TRAIL_PLAN.md) for the complete design.
+**Commit:** `16ed276` (design: `391cc5d`)
 
-**What was found:** `pipeline_audit` is real, and nothing in the codebase
-ever issues `UPDATE` or `DELETE` against it — but nothing at the *database*
-level stops one either; the guarantee is application discipline, not a
-database guarantee. Separately, it is stage-level (one row per DAG stage per
-run), not per-accession — there is no `accession_id` or `system_id` column,
-so "show every extraction attempt against accession X" is not answerable
-from it today, which is short of what a CMMC AU-3-grade record needs.
+**Context:** found via a direct audit against the specific claim "immutable
+audit trail." Deliberately sequenced across two sittings rather than one —
+see the history below — because rushing DB-level immutability and a hash
+chain through alongside two unrelated fixes is exactly the kind of change
+that goes wrong when hurried.
 
-**Why this entry stops at "designed" instead of "fixed," unlike §7 and §8
-above:** the fix touches the schema, a PostgreSQL-only trigger, three DAG
-stages, a new API endpoint, and a new CLI — enforcing immutability
-correctly (a hash chain with an honestly-stated limit on what it does and
-doesn't prove cryptographically, plus a trigger that can only be verified
-against live PostgreSQL, not the SQLite the rest of the suite runs against)
-is exactly the kind of change that goes wrong when pushed through quickly
-alongside two other fixes in the same sitting. `docs/AUDIT_TRAIL_PLAN.md`
-specifies the schema, the hash-chain construction, the trigger SQL, which
-DAG stages get wired and why others are deliberately deferred, the test
-plan, and a suggested sequencing into independently reviewable pull
-requests — written so it can be implemented directly without redoing the
-design work, whenever it's picked up.
+**What was found:** `pipeline_audit` was real, and nothing in the codebase
+issued `UPDATE` or `DELETE` against it — but nothing at the *database* level
+stopped one either; the guarantee was application discipline, not a
+database guarantee. Separately, it was stage-level (one row per DAG stage
+per run), not per-accession — there was no `accession_id` or `system_id`
+column, so "show every extraction attempt against accession X" was not
+answerable from it, short of what a CMMC AU-3-grade record needs.
+
+**What happened in between, honestly:** the first pass on this (`391cc5d`)
+stopped at a design document, [`docs/AUDIT_TRAIL_PLAN.md`](AUDIT_TRAIL_PLAN.md),
+rather than shipping code — the schema, hash-chain construction, trigger
+SQL, DAG wiring points, and a suggested PR sequencing, written so the
+design work wouldn't need redoing whenever it was picked up. It was picked
+up in the next sitting and built out in full against that plan.
+
+**Fix (`16ed276`):** a new `extraction_audit` table (`src/schema.py`,
+migration `2cf6396ba519`) — one row per accession per extraction attempt,
+carrying `system_id`, `content_hash`, and a `row_hash`/`prev_row_hash`
+chain (`src/audit.py::compute_row_hash`, SHA-256 over the row's own fields
+plus the previous row's hash). The same migration installs a
+dialect-guarded PostgreSQL `BEFORE UPDATE OR DELETE` trigger on both
+`pipeline_audit` and `extraction_audit`, so immutability is now enforced by
+the database, not just unexercised by the application. Wired into
+`download_raw_documents`, `parse_xbrl_facts`, and `load_to_warehouse`
+(`dags/edgar_pipeline.py`) — deliberately *not* swallowed on failure, unlike
+`score_anomalies`'s non-blocking behavior, because an audit trail that can
+silently fail to record isn't one. Exposed via `GET /audit/{accession}`
+(`api/main.py`) and `scripts/verify_audit_chain.py`, the CLI that walks the
+whole chain and reports exactly where it broke, for whoever's actually
+doing the auditing.
+
+**A real gap the plan itself missed, caught by testing the tamper path
+directly rather than only testing that a clean chain verifies:** the first
+implementation of `compute_row_hash` omitted the `detail` field from its
+hash inputs. A chain with a tampered `detail` value reported `VALID` right
+up until
+`tests/test_audit.py::TestTamperDetection::test_altering_detail_field_alone_is_caught`
+caught it. Fixed by adding `detail` as a hash input, and noted directly in
+`compute_row_hash`'s docstring so the next person touching this function
+sees why every field matters, not just the obviously load-bearing ones.
+
+**Verification:** `tests/test_audit.py::TestTamperDetection` tampers
+`detail`, `extraction_status`, a middle row, the last row, and the first
+row via raw `UPDATE`/`DELETE` (standing in for what the trigger would
+otherwise block on PostgreSQL — SQLite, which the unit suite runs against,
+cannot execute the trigger DDL at all) and asserts `verify_chain` names the
+exact broken row in every case. The trigger itself is verified separately,
+against a live `postgres:16-alpine` service container in
+`.github/workflows/ci.yml`, by inserting into both audit tables and
+asserting `UPDATE` and `DELETE` both raise.
 
 This entry is itself part of the point of this log: not every gap found
-gets shipped in the sitting it was found in, and that's a decision, not an
-omission.
+gets shipped in the sitting it was found in — deferring it was a decision,
+not an omission — and the record above shows both halves, the deferral and
+the follow-through.

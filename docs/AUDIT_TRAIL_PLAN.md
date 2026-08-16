@@ -1,8 +1,15 @@
 # Implementation plan: hash-chained, per-accession, DB-enforced audit trail
 
-**Status:** Not implemented. This is a design document for whoever picks up
-the work next — human or agent — written so it can be implemented directly
-without re-deriving the design.
+**Status:** Implemented, following the sequencing in §10. `src/audit.py`,
+migration `2cf6396ba519`, the DAG wiring, the `GET /audit/{accession}`
+endpoint, and `scripts/verify_audit_chain.py` all exist and are tested —
+see `docs/DECISION_LOG.md` §9 for what shipped, what changed from this plan
+during implementation (notably: the hash formula here was missing the
+`detail` field, caught by a tamper-path test rather than by inspection —
+see `src/audit.py`'s `compute_row_hash` docstring), and the commit history
+for the sequence of PRs. This document is kept as the design rationale —
+the *why* behind the schema and hash-chain choices — rather than removed,
+since the code doesn't explain those trade-offs on its own.
 
 **Why this is a separate document instead of a diff:** the other two gaps in
 this audit (backoff jitter, idempotent UPSERTs) were each a bounded, single-PR
@@ -96,15 +103,34 @@ than imply more than is built.
 ```python
 row_hash = sha256(
     (prev_row_hash or "")
-    + "\x1f" + system_id
-    + "\x1f" + (accession_number or "")
-    + "\x1f" + run_id
-    + "\x1f" + stage
-    + "\x1f" + extraction_status
-    + "\x1f" + created_at.isoformat()
-    + "\x1f" + (content_hash or "")
+    + "\x1f"
+    + system_id
+    + "\x1f"
+    + (accession_number or "")
+    + "\x1f"
+    + run_id
+    + "\x1f"
+    + stage
+    + "\x1f"
+    + extraction_status
+    + "\x1f"
+    + created_at.isoformat()
+    + "\x1f"
+    + (content_hash or "")
+    + "\x1f"
+    + (detail or "")
 ).hexdigest()
 ```
+
+`detail` is included deliberately: it's the one free-text field on this
+table, most often an error message — exactly the content someone tampering
+with a record would want to alter. An early implementation draft omitted it
+from the hash, and a chain that verified as VALID after `detail` alone was
+mutated is what caught the gap — see
+`tests/test_audit.py::TestTamperDetection::test_altering_detail_field_alone_is_caught`.
+Worth calling out here: the value of testing the tamper path directly,
+rather than only testing that a clean chain verifies, is exactly this — a
+happy-path-only test suite would have shipped this gap silently.
 
 (`\x1f`, ASCII unit separator, matches the delimiter convention already
 established in `src/upsert.py::compute_fact_hash` — reuse that convention,
