@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software or reference its design in your own work,
+  please cite it as below.
+type: software
+title: SEC EDGAR Extraction Pipeline
+authors:
+  - given-names: Austin
+    family-names: Kuo
+    alias: A-Kuo
+repository-code: "https://github.com/A-Kuo/sec-edgar-extraction-pipeline"
+abstract: >-
+  A data engineering pipeline that ingests SEC 10-K/10-Q filings, extracts
+  structured financial facts from XBRL, validates data quality (completeness
+  and PSI drift detection), persists idempotently to PostgreSQL with an
+  append-only audit trail, serves results through a Redis-cached FastAPI
+  layer, and answers citation-grounded questions over filing text via a
+  deterministic TF-IDF retrieval layer.
+keywords:
+  - data-engineering
+  - etl
+  - airflow
+  - sec-edgar
+  - xbrl
+  - fastapi
+  - data-quality
+  - retrieval-augmented-generation
+license: MIT
+date-released: "2026-05-15"
