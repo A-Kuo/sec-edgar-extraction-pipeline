@@ -10,6 +10,21 @@ Usage
     python -m scripts.backfill --cik 320193 789019 --form 10-K --dry-run
     python -m scripts.backfill --ticker AAPL MSFT --start-date 2023-01-01
 
+Resumable / incremental runs
+-----------------------------
+Progress is checkpointed to a local JSON file (``--checkpoint-file``, default
+``.backfill_checkpoint.json``) after *every* successfully processed filing —
+not just at the end — so a crash or Ctrl-C mid-run doesn't lose completed
+work.
+
+    # Resume: skip accessions already recorded as done for this CIK,
+    # instead of restarting the whole date range from scratch.
+    python -m scripts.backfill --cik 320193 --start-date 2010-01-01 --resume
+
+    # Incremental: only fetch filings newer than the last one this CIK
+    # successfully completed, ignoring --start-date for that CIK.
+    python -m scripts.backfill --cik 320193 --since-last-run
+
 Environment variables required
 -------------------------------
     DATABASE_URL   postgresql://...
@@ -20,10 +35,12 @@ Environment variables required
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
 from datetime import date, datetime
+from pathlib import Path
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,7 +100,50 @@ def _parse_args() -> argparse.Namespace:
         metavar="N",
         help="Number of parallel download workers (default: 1).",
     )
+    p.add_argument(
+        "--checkpoint-file",
+        default=".backfill_checkpoint.json",
+        metavar="PATH",
+        help="Where to persist per-CIK progress (default: .backfill_checkpoint.json).",
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip accessions already recorded as completed in the checkpoint file "
+        "for this CIK, instead of reprocessing the whole date range.",
+    )
+    p.add_argument(
+        "--since-last-run",
+        action="store_true",
+        help="Only fetch filings newer than the last one this CIK completed "
+        "(per the checkpoint file), overriding --start-date for that CIK. "
+        "Implies --resume.",
+    )
     return p.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint state — {"<cik>": {"completed": [accession, ...], "last_filing_date": "YYYY-MM-DD"}}
+# ---------------------------------------------------------------------------
+
+
+def _load_checkpoint(path: str) -> dict:
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Could not read checkpoint file %s (%s) — starting fresh.", path, exc)
+        return {}
+
+
+def _save_checkpoint(path: str, checkpoint: dict) -> None:
+    """Write the checkpoint atomically (write to a temp file, then rename)."""
+    p = Path(path)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(checkpoint, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(p)
 
 
 def _resolve_ciks(tickers: list[str], client) -> list[str]:
@@ -131,14 +191,35 @@ def _ingest_cik(
     parser,
     engine,
     cache,
+    checkpoint: dict,
+    checkpoint_path: str,
+    resume: bool,
+    since_last_run: bool,
 ) -> tuple[int, int]:
     """
     Ingest all matching filings for a single CIK.
+
+    Checkpoint-aware: if *resume* or *since_last_run* is set, accessions
+    already recorded as completed for this CIK are skipped. After every
+    successfully processed filing, the checkpoint is updated and written
+    to *checkpoint_path* immediately — a crash or Ctrl-C partway through a
+    long backfill loses at most the one filing in flight, not the whole run.
 
     Returns (filings_processed, facts_inserted).
     """
     from sqlalchemy.orm import Session
     from src.schema import FilingRaw, FinancialFact
+
+    cik_state = checkpoint.setdefault(cik, {"completed": [], "last_filing_date": None})
+    completed_accessions = set(cik_state["completed"])
+
+    effective_start_date = start_date
+    if since_last_run and cik_state["last_filing_date"]:
+        effective_start_date = max(start_date, cik_state["last_filing_date"])
+        logger.info(
+            "CIK %s: --since-last-run — using start date %s (checkpoint) instead of %s (CLI)",
+            cik, effective_start_date, start_date,
+        )
 
     logger.info("Fetching submission history for CIK %s", cik)
     submissions = client.get_company_filings(cik)
@@ -151,7 +232,7 @@ def _ingest_cik(
     ticker = (submissions.get("tickers") or [""])[0]
 
     # Filter to requested date range and form types
-    candidates = [
+    all_candidates = [
         {
             "accession_number": accessions[i],
             "cik": cik,
@@ -162,12 +243,18 @@ def _ingest_cik(
         }
         for i in range(len(accessions))
         if forms[i] in form_types
-        and start_date <= dates[i] <= end_date
+        and effective_start_date <= dates[i] <= end_date
     ]
 
+    candidates = all_candidates
+    skipped_done = 0
+    if resume or since_last_run:
+        candidates = [c for c in all_candidates if c["accession_number"] not in completed_accessions]
+        skipped_done = len(all_candidates) - len(candidates)
+
     logger.info(
-        "CIK %s: %d filings in range [%s, %s] for form(s) %s",
-        cik, len(candidates), start_date, end_date, form_types,
+        "CIK %s: %d filings in range [%s, %s] for form(s) %s (%d already completed, skipped)",
+        cik, len(candidates), effective_start_date, end_date, form_types, skipped_done,
     )
 
     if dry_run:
@@ -232,7 +319,16 @@ def _ingest_cik(
             filings_done += 1
             logger.info("    ✓ %d facts inserted for %s", len(fact_rows) if fact_rows else 0, acc)
 
+            # Persist progress immediately — not just at the end of the run —
+            # so a crash or Ctrl-C on the *next* filing doesn't re-do this one.
+            completed_accessions.add(acc)
+            cik_state["completed"] = sorted(completed_accessions)
+            if cik_state["last_filing_date"] is None or filing["filing_date"] > cik_state["last_filing_date"]:
+                cik_state["last_filing_date"] = filing["filing_date"]
+            _save_checkpoint(checkpoint_path, checkpoint)
+
         except KeyboardInterrupt:
+            logger.warning("Interrupted — progress through the last completed filing was saved to %s", checkpoint_path)
             raise
         except Exception as exc:
             logger.error("    ✗ Failed for %s: %s", acc, exc)
@@ -270,6 +366,9 @@ def main() -> None:
     total_filings = 0
     total_facts = 0
 
+    checkpoint = _load_checkpoint(args.checkpoint_file) if not args.dry_run else {}
+    resume = args.resume or args.since_last_run
+
     for cik in ciks:
         f, facts = _ingest_cik(
             cik=cik,
@@ -281,6 +380,10 @@ def main() -> None:
             parser=parser,
             engine=engine,
             cache=cache,
+            checkpoint=checkpoint,
+            checkpoint_path=args.checkpoint_file,
+            resume=resume,
+            since_last_run=args.since_last_run,
         )
         total_filings += f
         total_facts += facts
@@ -289,6 +392,8 @@ def main() -> None:
         f"\n{'[DRY RUN] ' if args.dry_run else ''}Backfill complete: "
         f"{total_filings} filings processed, {total_facts} facts inserted."
     )
+    if not args.dry_run:
+        print(f"Checkpoint saved to {args.checkpoint_file} — rerun with --resume or --since-last-run to continue.")
 
 
 if __name__ == "__main__":

@@ -184,6 +184,18 @@ python scripts/backfill.py \
   --end-date 2024-01-01
 ```
 
+Progress checkpoints to `.backfill_checkpoint.json` after every successfully
+processed filing, so a crash or `Ctrl-C` mid-run doesn't lose completed work:
+
+```bash
+# Resume: skip accessions already completed for this CIK.
+python scripts/backfill.py --cik 0000320193 --start-date 2020-01-01 --resume
+
+# Incremental: only fetch filings newer than the last one this CIK
+# completed, ignoring --start-date for that CIK.
+python scripts/backfill.py --cik 0000320193 --since-last-run
+```
+
 ### Run quality checks against a pipeline run
 
 ```bash
@@ -211,6 +223,8 @@ pytest tests/test_parser.py -v       # XBRL extraction, units, periods
 pytest tests/test_quality.py -v      # completeness + PSI edge cases
 pytest tests/test_dag.py -v          # DAG structure and task wiring
 pytest tests/test_rag.py -v          # chunking, retrieval, citation-first QA, eval harness
+pytest tests/test_load_idempotency.py -v  # idempotent UPSERT into financial_facts
+pytest tests/test_backfill.py -v     # backfill checkpoint persistence, --resume/--since-last-run filtering
 pytest --cov=src --cov=api tests/    # with coverage
 ```
 

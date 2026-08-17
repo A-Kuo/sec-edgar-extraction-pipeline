@@ -52,3 +52,6 @@ Thumbs.db
 
 # Docker
 *.log
+
+# Local run state
+.backfill_checkpoint.json
