@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Docker Ready](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
 
-> A data engineering pipeline that ingests SEC 10-K/10-Q filings, extracts structured financial facts from XBRL, validates data quality, and serves the results through a caching API.
+> A data engineering pipeline that ingests SEC 10-K/10-Q filings, extracts structured financial facts from XBRL, validates data quality, serves the results through a caching API, and answers citation-grounded questions over the filing text itself.
 
 ## Problem
 
@@ -19,8 +19,9 @@ This pipeline automates the full path from raw filing to queryable, versioned fi
 3. **Validate** — a quality layer checks field completeness against a threshold and flags statistical drift (PSI) in extracted values before anything is trusted downstream.
 4. **Store** — validated facts land in PostgreSQL with an append-only audit trail and amendment-aware version history.
 5. **Serve** — a FastAPI layer exposes filings and time-series facts, backed by a Redis cache.
+6. **Research** — a retrieval layer chunks filing text into Item-level sections and answers natural-language questions with citations back to the specific accession and section, refusing to answer when nothing in the indexed filings actually supports it.
 
-The pipeline is orchestrated end-to-end by an Airflow DAG and runs entirely deterministically — no LLM is involved in extraction.
+The structured-extraction pipeline (steps 1-5) is orchestrated end-to-end by an Airflow DAG and runs entirely deterministically — no LLM is involved. The retrieval layer (step 6) is the one place an LLM can optionally participate, and only to *phrase* an answer already constrained to retrieved filing text — never to originate facts. See [Retrieval &amp; Q&amp;A](#retrieval--qa) below.
 
 ## Architecture
 
@@ -65,9 +66,14 @@ sec-edgar-extraction-pipeline/
 │   ├── xbrl_parser.py      # XBRL HTML -> financial fact extraction
 │   ├── quality.py          # Completeness checks + PSI drift detection
 │   ├── cache.py            # Redis caching (CIK, filing index, facts)
-│   └── alerts.py           # Slack/SMTP alerting on pipeline failure
+│   ├── alerts.py           # Slack/SMTP alerting on pipeline failure
+│   └── rag/
+│       ├── chunker.py       # Filing text -> provenance-tagged chunks
+│       ├── retrieval.py     # TF-IDF retrieval over chunks
+│       ├── qa.py            # Citation-first answer construction
+│       └── evaluation.py    # Retrieval recall / citation validity / refusal-accuracy harness
 ├── api/
-│   └── main.py              # FastAPI serving layer
+│   └── main.py              # FastAPI serving layer (includes /ask/{ticker})
 ├── dags/
 │   └── edgar_pipeline.py    # Airflow DAG (7-task pipeline)
 ├── scripts/
@@ -138,6 +144,37 @@ curl http://localhost:8000/facts/AAPL/Revenues
 curl -X POST http://localhost:8000/trigger/AAPL
 ```
 
+### Retrieval &amp; Q&amp;A
+
+```bash
+curl -G http://localhost:8000/ask/AAPL --data-urlencode "q=What supply chain risk does the company describe?"
+```
+
+```json
+{
+  "ticker": "AAPL",
+  "question": "What supply chain risk does the company describe?",
+  "answer": "Based on 10-K 0000320193-24-000123 (Item 1A. Risk Factors): The Company relies on single-source and limited-source suppliers for some components, which increases the Company's supply chain risk...",
+  "grounded": true,
+  "citations": [
+    {"accession_number": "0000320193-24-000123", "section": "Item 1A. Risk Factors", "snippet": "...", "score": 0.34}
+  ]
+}
+```
+
+If nothing in the ticker's indexed filing text is relevant to the question, the response comes back with `"grounded": false` and an explicit refusal instead of a guess:
+
+```bash
+curl -G http://localhost:8000/ask/AAPL --data-urlencode "q=What is the CEO's favorite color?"
+# {"grounded": false, "answer": "I do not find support for this in the supplied filings.", "citations": []}
+```
+
+Run the evaluation harness (retrieval recall@k, citation validity, refusal accuracy) against the seed question set:
+
+```bash
+pytest tests/test_rag.py::TestEvaluationHarness -v
+```
+
 ### Backfill historical data
 
 ```bash
@@ -173,6 +210,7 @@ pytest tests/test_client.py -v       # rate limiting, retry/backoff
 pytest tests/test_parser.py -v       # XBRL extraction, units, periods
 pytest tests/test_quality.py -v      # completeness + PSI edge cases
 pytest tests/test_dag.py -v          # DAG structure and task wiring
+pytest tests/test_rag.py -v          # chunking, retrieval, citation-first QA, eval harness
 pytest --cov=src --cov=api tests/    # with coverage
 ```
 
@@ -188,6 +226,7 @@ Tests run against an in-memory SQLite database and a mocked Redis client, with `
 | `MOCK_EDGAR` | `false` | Set `true` for local dev/tests to use fixture data instead of live calls |
 | `SLACK_WEBHOOK_URL` | unset | Optional Slack alerting on pipeline failure |
 | `SMTP_HOST`, `ALERT_EMAIL_TO` | unset | Optional email alerting on pipeline failure |
+| `OPENAI_API_KEY` | unset | Optional — enables LLM-phrased answers in `/ask`. Without it, answers are extractive (quoted directly from the retrieved chunk); this is the default and what tests exercise |
 
 ## Key Design Decisions
 
@@ -196,6 +235,17 @@ Tests run against an in-memory SQLite database and a mocked Redis client, with `
 - **Cache-first API.** Every read endpoint checks Redis first and falls back to PostgreSQL, with graceful degradation if Redis is unavailable.
 - **Rate-limited ingestion.** A token-bucket limiter keeps requests to SEC EDGAR at or below 10 req/s, per their access guidelines.
 - **Drift-aware quality gates.** PSI (Population Stability Index) on extracted fact distributions flags data quality regressions before they reach the warehouse, not after.
+- **Retrieval, not a chatbot.** `/ask` refuses to answer (`grounded: false`) when nothing in the indexed filings scores above a relevance threshold, instead of always producing a confident-sounding response. See "Known failure modes" below for where this still falls short.
+- **TF-IDF over embeddings for retrieval.** The corpus size this project targets (a scoped watchlist of tickers, not all of EDGAR) doesn't need a vector index or GPU dependency. TF-IDF is deterministic, runs offline, and keeps the test suite fast and network-free.
+
+## Known Failure Modes and Mitigations
+
+| Failure mode | Cause | Mitigation |
+|---|---|---|
+| Out-of-scope questions about a *different* company can score above the grounding threshold | Pure lexical retrieval matches shared financial boilerplate ("fiscal 2024", "net sales") even when the entity is wrong | `/ask/{ticker}` scopes the index to one ticker's ingested filings, so cross-entity confusion mostly can't occur through the API; it remains a real limitation of the retriever used in isolation (see `AGENTS.md`) |
+| Citation snippet doesn't contain the supporting sentence | Naive truncation from the start of a chunk cuts off the fact past a heading/boilerplate opener | Citations are built around the sentence with the highest term overlap with the question, not the chunk's first sentence (`_best_sentence_window` in `src/rag/qa.py`) |
+| `download_raw_documents` currently persists the filing *index* page, not the primary document body | Simplification in the initial ingestion implementation | Tracked as a known gap — `/ask` and the RAG tests operate on realistic narrative fixtures; production `raw_html` content needs this fixed before `/ask` returns useful answers against real ingested data |
+| Retrieval quality degrades on very small corpora (few ingested filings for a ticker) | TF-IDF needs enough documents for IDF weighting to be meaningful | `max_df` filtering was intentionally left disabled to avoid `sklearn` errors on single-chunk corpora; expect noisier ranking until a ticker has several filings ingested |
 
 ## Contributing
 
@@ -215,4 +265,4 @@ Issues and questions: [GitHub Issues](https://github.com/A-Kuo/sec-edgar-extract
 
 ---
 
-**Status:** Core pipeline complete (ingestion, parsing, quality, caching, API, DAG, tests) | **Last updated:** August 2026
+**Status:** Core pipeline complete (ingestion, parsing, quality, caching, API, DAG, tests); citation-grounded retrieval layer (`/ask`) added | **Last updated:** August 2026

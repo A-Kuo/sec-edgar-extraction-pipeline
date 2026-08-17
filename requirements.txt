@@ -13,3 +13,4 @@ requests-mock>=1.11.0
 pytest-cov>=4.1.0
 python-dotenv>=1.0.0
 httpx2>=0.1.0
+scikit-learn>=1.4.0

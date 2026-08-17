@@ -401,6 +401,61 @@ class TestTimeSeries:
 
 
 # ---------------------------------------------------------------------------
+# GET /ask/{ticker}
+# ---------------------------------------------------------------------------
+
+_NARRATIVE_10K_ROW = (
+    "0000320193-24-000123",
+    "320193",
+    "AAPL",
+    "10-K",
+    "<html><body><h2>Item 1A. Risk Factors</h2><p>The Company relies on single-source "
+    "and limited-source suppliers for some components, which increases the Company's "
+    "supply chain risk.</p></body></html>",
+)
+
+
+class TestAsk:
+    def setup_method(self):
+        _clear_overrides()
+
+    def test_404_when_no_filing_text_indexed(self):
+        db = _mock_db_execute(fetchall=[])
+        cache = _mock_cache()
+        client = _override(db=db, cache=cache)
+        resp = client.get("/ask/AAPL", params={"q": "What are the risk factors?"})
+        assert resp.status_code == 404
+
+    def test_grounded_question_returns_citation(self):
+        db = _mock_db_execute(fetchall=[_NARRATIVE_10K_ROW])
+        cache = _mock_cache()
+        client = _override(db=db, cache=cache)
+        resp = client.get("/ask/AAPL", params={"q": "What supply chain risk does the company describe?"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["grounded"] is True
+        assert body["citations"]
+        assert body["citations"][0]["accession_number"] == "0000320193-24-000123"
+
+    def test_unrelated_question_is_refused(self):
+        db = _mock_db_execute(fetchall=[_NARRATIVE_10K_ROW])
+        cache = _mock_cache()
+        client = _override(db=db, cache=cache)
+        resp = client.get("/ask/AAPL", params={"q": "What is the plan for lunar mining operations?"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["grounded"] is False
+        assert body["citations"] == []
+
+    def test_question_too_short_is_rejected(self):
+        db = _mock_db_execute(fetchall=[_NARRATIVE_10K_ROW])
+        cache = _mock_cache()
+        client = _override(db=db, cache=cache)
+        resp = client.get("/ask/AAPL", params={"q": "?"})
+        assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
 # POST /trigger/{ticker}
 # ---------------------------------------------------------------------------
 
@@ -463,6 +518,7 @@ class TestOpenAPISchema:
         assert "/filings/{ticker}" in paths
         assert "/filing/{accession}" in paths
         assert "/facts/{ticker}/{fact_name}" in paths
+        assert "/ask/{ticker}" in paths
         assert "/trigger/{ticker}" in paths
 
     def test_all_endpoints_have_summaries(self):

@@ -7,10 +7,13 @@ Endpoints
   GET  /filings/{ticker}            list filings with metadata (paginated)
   GET  /filing/{accession}          parsed financial_facts for one filing
   GET  /facts/{ticker}/{fact_name}  time-series of a specific fact
+  GET  /ask/{ticker}                citation-grounded Q&A over a ticker's filing text
   POST /trigger/{ticker}            trigger on-demand ingestion
 
 All read endpoints check Redis before hitting PostgreSQL.
 Cache misses populate Redis so subsequent calls are served from memory.
+/ask builds its retrieval index on demand from filings_raw (see src/rag/)
+rather than caching it -- see AGENTS.md for the tradeoff.
 
 Run with:
     uvicorn api.main:app --reload
@@ -157,6 +160,22 @@ class TriggerResponse(BaseModel):
     cik: str | None
     status: str
     message: str
+
+
+class AskCitation(BaseModel):
+    accession_number: str
+    section: str
+    snippet: str
+    source_url: str | None
+    score: float
+
+
+class AskResponse(BaseModel):
+    ticker: str
+    question: str
+    answer: str
+    grounded: bool
+    citations: list[AskCitation]
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +462,81 @@ def get_fact_time_series(
                 segment=r[6],
             )
             for r in rows
+        ],
+    )
+
+
+@app.get(
+    "/ask/{ticker}",
+    response_model=AskResponse,
+    summary="Ask a citation-grounded question about a ticker's filings",
+    description=(
+        "Retrieves the most relevant sections across a ticker's ingested filing text "
+        "(TF-IDF over Item-level chunks) and returns a citation-first answer. "
+        "If nothing in the indexed filings is relevant enough, returns grounded=false "
+        "with a refusal message instead of guessing — this is a retrieval-grounded "
+        "research aid, not a general chatbot. No filing text indexed, no answer."
+    ),
+    tags=["research"],
+)
+def ask_question(
+    ticker: str,
+    db: DBDep,
+    q: Annotated[str, Query(min_length=3, description="Natural-language question")],
+    top_k: Annotated[int, Query(ge=1, le=20, description="Number of chunks to retrieve")] = 5,
+) -> AskResponse:
+    ticker_upper = ticker.upper()
+
+    rows = db.execute(
+        text(
+            "SELECT accession_number, cik, ticker, filing_type, raw_html "
+            "FROM filings_raw WHERE UPPER(ticker) = :t AND raw_html IS NOT NULL"
+        ),
+        {"t": ticker_upper},
+    ).fetchall()
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No indexed filing text found for ticker '{ticker}'",
+        )
+
+    from src.rag.chunker import chunk_document
+    from src.rag.qa import answer_question
+    from src.rag.retrieval import FilingRetriever
+
+    chunks = []
+    for accession, cik, tkr, form_type, raw_html in rows:
+        chunks.extend(
+            chunk_document(
+                raw_html,
+                accession_number=accession,
+                cik=cik,
+                ticker=tkr,
+                form_type=form_type,
+            )
+        )
+
+    if not chunks:
+        raise HTTPException(status_code=404, detail=f"No chunkable filing text for ticker '{ticker}'")
+
+    retriever = FilingRetriever(chunks)
+    answer = answer_question(q, retriever, top_k=top_k)
+
+    return AskResponse(
+        ticker=ticker_upper,
+        question=q,
+        answer=answer.answer_text,
+        grounded=answer.grounded,
+        citations=[
+            AskCitation(
+                accession_number=c.accession_number,
+                section=c.section,
+                snippet=c.snippet,
+                source_url=c.source_url,
+                score=c.score,
+            )
+            for c in answer.citations
         ],
     )
 
