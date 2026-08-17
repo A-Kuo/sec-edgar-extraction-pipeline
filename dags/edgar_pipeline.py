@@ -635,6 +635,28 @@ def send_alerts_on_failure(**context: Any) -> None:
     )
 
 
+def collect_run_metrics(**context: Any) -> None:
+    """
+    Stage 9 — Record aggregated metrics for the completed run.
+
+    Reads PipelineAudit, ExtractionAudit, and ModelRun tables to compute
+    ingestion volumes, success rates, and per-stage durations, then appends
+    to metrics/run_metadata.json.
+    """
+    run_id: str = context["run_id"]
+
+    if MOCK_EDGAR:
+        logger.info("[MOCK] metrics collected for run=%s", run_id)
+        return
+
+    from src.metrics import collect_run_metrics as record_metrics
+
+    try:
+        record_metrics(run_id, DATABASE_URL)
+    except Exception as exc:
+        logger.warning("Failed to record metrics for run=%s: %s", run_id, exc)
+
+
 # ---------------------------------------------------------------------------
 # Database helpers (production-only, not called in MOCK_EDGAR mode)
 # ---------------------------------------------------------------------------
@@ -849,6 +871,11 @@ with DAG(
         trigger_rule=TriggerRule.ONE_FAILED,
     )
 
+    task_metrics = PythonOperator(
+        task_id="collect_run_metrics",
+        python_callable=collect_run_metrics,
+    )
+
     # Linear chain for the happy path
     (
         task_fetch
@@ -858,6 +885,7 @@ with DAG(
         >> task_score
         >> task_load
         >> task_audit
+        >> task_metrics
     )
 
     # Alert task depends on all pipeline tasks so it fires on any failure
