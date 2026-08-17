@@ -236,6 +236,28 @@ airflow dags test edgar_pipeline 2024-01-15
 
 Every task writes a start/end row to `pipeline_audit`, which is append-only — no `UPDATE`/`DELETE` is ever issued against it.
 
+## Test Coverage
+
+169 tests, full suite runs in ~6 seconds, no external services required
+(in-memory SQLite, mocked Redis, `MOCK_EDGAR=true` fixture data):
+
+| Module | Tests | What it covers |
+|---|---|---|
+| `test_api.py` | 36 | FastAPI endpoints, Redis cache-then-DB behavior, OpenAPI schema |
+| `test_parser.py` | 34 | XBRL extraction — units, periods, segments, amendment supersession |
+| `test_quality.py` | 28 | Completeness thresholds, PSI drift detection edge cases |
+| `test_dag.py` | 23 | DAG task wiring, mock-mode task callables, alerting trigger rule |
+| `test_rag.py` | 15 | Chunking, TF-IDF retrieval, citation-first QA, evaluation harness |
+| `test_client.py` | 14 | Rate limiting, retry/backoff, 429/503 handling |
+| `test_load_idempotency.py` | 6 | UPSERT dedup on retry/reprocessing, NULL-safety |
+| `test_analytics_marts.py` | 5 | `fct_company_year(_yoy)` views against the real migration |
+| `test_backfill.py` | 8 | Checkpoint persistence, `--resume` / `--since-last-run` filtering |
+
+Structural scale, for context: 7-task Airflow DAG, 6 FastAPI endpoints,
+2 Alembic migrations, 4 warehouse tables + 2 analytics views. There is
+no CI pipeline configured yet — `pytest tests/ -v` passing locally is the
+current bar for a change being considered done (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+
 ## Testing
 
 ```bash
