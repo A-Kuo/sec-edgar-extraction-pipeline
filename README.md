@@ -196,6 +196,29 @@ python scripts/backfill.py --cik 0000320193 --start-date 2020-01-01 --resume
 python scripts/backfill.py --cik 0000320193 --since-last-run
 ```
 
+### Analytics: revenue trend and YoY growth by company
+
+`financial_facts` is an OLTP table — one row per fact per filing — so "revenue
+trend for AAPL over 5 years" means hand-writing a pivot query against it.
+Two SQL views (`migrations/versions/0002_analytics_marts.py`) close that gap:
+
+```sql
+-- fct_company_year: one row per (cik, fiscal_year), target facts pivoted into columns
+SELECT fiscal_year, revenue, net_income, total_assets
+FROM fct_company_year
+WHERE cik = '320193'
+ORDER BY fiscal_year;
+
+-- fct_company_year_yoy: same, plus prior-year values and YoY growth %
+SELECT fiscal_year, revenue, revenue_yoy_growth_pct, net_income_yoy_growth_pct
+FROM fct_company_year_yoy
+WHERE cik = '320193'
+ORDER BY fiscal_year;
+```
+
+Both are plain views, not materialized — always consistent with
+`financial_facts` on read, no refresh job needed at this data volume.
+
 ### Run quality checks against a pipeline run
 
 ```bash
@@ -225,6 +248,7 @@ pytest tests/test_dag.py -v          # DAG structure and task wiring
 pytest tests/test_rag.py -v          # chunking, retrieval, citation-first QA, eval harness
 pytest tests/test_load_idempotency.py -v  # idempotent UPSERT into financial_facts
 pytest tests/test_backfill.py -v     # backfill checkpoint persistence, --resume/--since-last-run filtering
+pytest tests/test_analytics_marts.py -v  # fct_company_year / fct_company_year_yoy views (real migration, real SQL)
 pytest --cov=src --cov=api tests/    # with coverage
 ```
 
