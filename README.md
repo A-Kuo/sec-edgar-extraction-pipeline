@@ -65,6 +65,52 @@ SEC EDGAR API
 └────────────────────────────────────────────┘
 ```
 
+The diagram above is a summary; below is the actual DAG, rendered by Airflow (`airflow dags show edgar_pipeline`) rather than hand-drawn — the two failure/alerting edges into `send_alerts_on_failure` are structural, not decorative.
+
+![The 8-task DAG, rendered directly from dags/edgar_pipeline.py by Airflow](docs/images/dag_graph.png)
+
+## By the Numbers
+
+Everything below is measured, not asserted — reproduce any of it with `make ci` or the command noted.
+
+| Metric | Value |
+|---|---|
+| Tests | 482 passing (`make test`) |
+| Test coverage | 79% overall, gated at ≥75% in CI (`make coverage`) |
+| Database tables | 7, across 3 Alembic migrations |
+| API endpoints | 8 (`api/main.py`) |
+| DAG tasks | 8, one Airflow DAG (`dags/edgar_pipeline.py`) |
+| CI/CD workflows | 3 — [`ci.yml`](.github/workflows/ci.yml) (lint, test, migrations, live-Postgres trigger check), [`ml.yml`](.github/workflows/ml.yml) (train + gate the anomaly model), [`cd.yml`](.github/workflows/cd.yml) (tagged image build + publish) |
+
+| Test module | Focus | Count |
+|---|---|---|
+| `test_ml_model.py` | Hybrid anomaly model (IsolationForest + rules), scoring, serialization | 53 |
+| `test_api.py` | Endpoints, caching behavior, schemas, per-accession audit history | 50 |
+| `test_ml_features.py` | Feature extraction and engineering for the anomaly model | 51 |
+| `test_ml_registry.py` | Model registration, hash verification, promotion | 37 |
+| `test_dag.py` | DAG structure, task wiring, extraction-audit wiring (mocked Airflow) | 35 |
+| `test_parser.py` | XBRL extraction — units, periods, amendments | 34 |
+| `test_upsert.py` | Idempotent UPSERTs, incl. mid-batch worker-restart replay | 32 |
+| `test_ml_monitoring.py` | PSI drift detection, on facts and on the model | 27 |
+| `test_quality.py` | Completeness thresholds, PSI edge cases | 28 |
+| `test_audit.py` | Hash-chain construction, verification, tamper detection | 40 |
+| `test_client.py` | Rate limiting, full-jitter retry/backoff | 23 |
+| `test_schema.py` | ORM models against real SQLite | 22 |
+| `test_scripts_ml.py` | `train_model.py` / `evaluate_model.py` CLIs | 21 |
+| `test_verify_audit_chain.py` | `verify_audit_chain.py` CLI — valid/broken/empty chains | 12 |
+| `test_alerts.py` | Slack/SMTP alerting | 14 |
+| `test_dag_import.py` | DAG imports against the **real** installed Airflow | 3 |
+
+## Evidence
+
+The Swagger UI FastAPI generates from the actual route definitions in `api/main.py` — nothing hand-maintained to go stale:
+
+![Swagger UI listing all 8 endpoints, grouped by tag](docs/images/swagger_overview.png)
+
+And a real request against `GET /audit/{accession}`, against a seeded filing — the `row_hash`/`prev_row_hash` chain visible in the response is exactly what `scripts/verify_audit_chain.py` recomputes and checks:
+
+![A live Try-it-out response from GET /audit/{accession}, showing chained row_hash/prev_row_hash values](docs/images/audit_endpoint_response.png)
+
 ## Repository Structure
 
 ```
@@ -225,7 +271,7 @@ Tagged releases (`vX.Y.Z`) are built and pushed to GHCR automatically by `.githu
 ## Testing
 
 ```bash
-pytest tests/ -v                        # full suite (363 tests)
+pytest tests/ -v                        # full suite (482 tests) — see "By the Numbers" for the per-module breakdown
 pytest tests/test_api.py -v             # endpoints + caching behavior
 pytest tests/test_client.py -v          # rate limiting, retry/backoff
 pytest tests/test_parser.py -v          # XBRL extraction, units, periods
@@ -272,13 +318,26 @@ The bullets below state conclusions. [`docs/DECISION_LOG.md`](docs/DECISION_LOG.
 
 ## Contributing
 
-See [AGENTS.md](AGENTS.md) for the full architecture spec, schema definitions, and implementation notes.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow, and [AGENTS.md](AGENTS.md) for the architecture spec, schema definitions, and implementation notes. This project follows a [Code of Conduct](CODE_OF_CONDUCT.md).
 
 1. Create a feature branch: `git checkout -b feature/your-feature`
 2. Make changes and verify: `make ci` (lint, typecheck, tests, real DAG import — the same checks CI runs)
 3. Commit with a descriptive message and open a pull request
 
 Optionally, `pre-commit install` to catch lint/format/type issues before they reach CI.
+
+## Citation
+
+```bibtex
+@software{sec_edgar_extraction_pipeline_2026,
+  author = {Kuo, Austin},
+  title = {SEC EDGAR Extraction Pipeline},
+  url = {https://github.com/A-Kuo/sec-edgar-extraction-pipeline},
+  year = {2026}
+}
+```
+
+See [CITATION.cff](CITATION.cff).
 
 ## License
 
