@@ -9,7 +9,40 @@
 
 ## Problem
 
-SEC filings are published as unstructured HTML/XBRL documents. Pulling a single metric — revenue, net income, total assets — for a set of companies over time means manually locating filings, parsing inconsistent markup, and reconciling amendments. This doesn't scale past a handful of one-off lookups. And a parser that fails silently on a scale error or a dropped fact is worse than one that fails loudly — a wrong number that looks plausible costs far more to catch after the fact than a missing one.
+The SEC publishes every 10-K and 10-Q as an iXBRL document — HTML with financial
+facts machine-tagged inline. In principle that makes the numbers trivially
+extractable. In practice, five things make a naive parser silently wrong:
+
+**1. Scale attributes.** A revenue figure rendered as `391,035` may carry
+`scale="6"`, meaning the real value is 391,035,000,000. Read the text and ignore
+the attribute and you are off by six orders of magnitude — and the result still
+looks like a plausible number.
+
+**2. Instant versus duration periods.** Total assets is a balance at a point in
+time; revenue is a flow across a range. Both arrive as the same tag shape,
+distinguished only by whether the referenced context carries an `instant` or a
+`startDate`/`endDate` pair. Conflate them and you attribute a year's revenue to
+a single day.
+
+**3. Segment disaggregation.** The same concept is frequently tagged twice — once
+consolidated, once per reporting segment. Extraction that ignores the segment
+axis sums them and reports double the company's actual revenue.
+
+**4. Amendments supersede silently.** A 10-K/A replaces the original 10-K, often
+months later, sometimes restating figures. A pipeline without an amendment chain
+either double-counts both filings or keeps serving the superseded number
+indefinitely.
+
+**5. Rate limits are enforced.** SEC EDGAR caps clients at 10 requests per second
+and requires a declared User-Agent. Exceed it and you are blocked — mid-backfill,
+with partial state already written.
+
+Underneath all five is one property that shapes the whole design: **a wrong
+number that looks plausible costs far more than a missing one.** A dropped fact
+is visible on inspection. A revenue figure off by a factor of a thousand flows
+into a model, a dashboard, and a decision before anyone checks it. So this
+pipeline is built to fail loudly, prove where every number came from, and make
+tampering detectable after the fact.
 
 ## Solution
 
@@ -31,7 +64,7 @@ SEC EDGAR API
      │
      ▼
 ┌────────────────────────────────────────────┐
-│  Airflow DAG (8 tasks)                      │
+│  Airflow DAG (9 tasks)                      │
 ├────────────────────────────────────────────┤
 │ 1. fetch_new_filings      (EdgarClient)     │
 │ 2. download_raw_documents                   │
@@ -40,7 +73,8 @@ SEC EDGAR API
 │ 5. score_anomalies         (hybrid model)   │
 │ 6. load_to_warehouse       (PostgreSQL)     │
 │ 7. update_audit_trail      (append-only)    │
-│ 8. send_alerts_on_failure  (Slack/SMTP)     │
+│ 8. collect_run_metrics     (run_metadata)   │
+│ 9. send_alerts_on_failure  (Slack/SMTP)     │
 └────────────────────────────────────────────┘
      │
      ▼
@@ -67,7 +101,9 @@ SEC EDGAR API
 
 The diagram above is a summary; below is the actual DAG, rendered by Airflow (`airflow dags show edgar_pipeline`) rather than hand-drawn — the two failure/alerting edges into `send_alerts_on_failure` are structural, not decorative.
 
-![The 8-task DAG, rendered directly from dags/edgar_pipeline.py by Airflow](docs/images/dag_graph.png)
+![The DAG rendered directly from dags/edgar_pipeline.py by Airflow](docs/images/dag_graph.png)
+
+*Captured before `collect_run_metrics` was added, so it shows 8 of the current 9 tasks; the metrics task chains off `update_audit_trail`.*
 
 ## By the Numbers
 
@@ -75,31 +111,34 @@ Everything below is measured, not asserted — reproduce any of it with `make ci
 
 | Metric | Value |
 |---|---|
-| Tests | 482 passing (`make test`) |
-| Test coverage | 79% overall, gated at ≥75% in CI (`make coverage`) |
+| Tests | 501 passing (`make test`) |
+| Test coverage | 80% across `src`/`api`/`scripts`, gated at ≥75% in CI (`make coverage`) |
 | Database tables | 7, across 3 Alembic migrations |
 | API endpoints | 8 (`api/main.py`) |
-| DAG tasks | 8, one Airflow DAG (`dags/edgar_pipeline.py`) |
+| DAG tasks | 9, one Airflow DAG (`dags/edgar_pipeline.py`) |
 | CI/CD workflows | 3 — [`ci.yml`](.github/workflows/ci.yml) (lint, test, migrations, live-Postgres trigger check), [`ml.yml`](.github/workflows/ml.yml) (train + gate the anomaly model), [`cd.yml`](.github/workflows/cd.yml) (tagged image build + publish) |
 
 | Test module | Focus | Count |
 |---|---|---|
 | `test_ml_model.py` | Hybrid anomaly model (IsolationForest + rules), scoring, serialization | 53 |
-| `test_api.py` | Endpoints, caching behavior, schemas, per-accession audit history | 50 |
 | `test_ml_features.py` | Feature extraction and engineering for the anomaly model | 51 |
+| `test_api.py` | Endpoints, caching behavior, schemas, per-accession audit history | 50 |
+| `test_audit.py` | Hash-chain construction, verification, tamper detection | 40 |
 | `test_ml_registry.py` | Model registration, hash verification, promotion | 37 |
-| `test_dag.py` | DAG structure, task wiring, extraction-audit wiring (mocked Airflow) | 35 |
+| `test_dag.py` | DAG structure, task wiring, extraction-audit wiring (mocked Airflow) | 36 |
 | `test_parser.py` | XBRL extraction — units, periods, amendments | 34 |
 | `test_upsert.py` | Idempotent UPSERTs, incl. mid-batch worker-restart replay | 32 |
-| `test_ml_monitoring.py` | PSI drift detection, on facts and on the model | 27 |
 | `test_quality.py` | Completeness thresholds, PSI edge cases | 28 |
-| `test_audit.py` | Hash-chain construction, verification, tamper detection | 40 |
+| `test_ml_monitoring.py` | PSI drift detection, on facts and on the model | 27 |
 | `test_client.py` | Rate limiting, full-jitter retry/backoff | 23 |
 | `test_schema.py` | ORM models against real SQLite | 22 |
 | `test_scripts_ml.py` | `train_model.py` / `evaluate_model.py` CLIs | 21 |
-| `test_verify_audit_chain.py` | `verify_audit_chain.py` CLI — valid/broken/empty chains | 12 |
 | `test_alerts.py` | Slack/SMTP alerting | 14 |
+| `test_verify_audit_chain.py` | `verify_audit_chain.py` CLI — valid/broken/empty chains | 12 |
+| `test_metrics_collection.py` | Per-run metrics aggregation and the append-only metrics log | 9 |
+| `test_benchmark_pipeline.py` | Benchmark runner — mock-mode end-to-end, timing instrumentation | 9 |
 | `test_dag_import.py` | DAG imports against the **real** installed Airflow | 3 |
+| | **Total** | **501** |
 
 ## Evidence
 
@@ -116,24 +155,33 @@ And a real request against `GET /audit/{accession}`, against a seeded filing —
 ```
 sec-edgar-extraction-pipeline/
 ├── src/
-│   ├── schema.py           # SQLAlchemy ORM models (6 tables)
+│   ├── schema.py           # SQLAlchemy ORM models (7 tables)
 │   ├── edgar_client.py     # EDGAR API client (rate-limited, retry with backoff)
 │   ├── xbrl_parser.py      # XBRL HTML -> financial fact extraction
 │   ├── quality.py          # Completeness checks + PSI drift detection
 │   ├── cache.py            # Redis caching (CIK, filing index, facts)
 │   ├── alerts.py           # Slack/SMTP alerting on pipeline failure
+│   ├── metrics.py          # Per-run metrics aggregation -> metrics/run_metadata.json
 │   └── ml/                  # Anomaly detection (features, rules, model, registry, monitoring)
 ├── api/
-│   └── main.py              # FastAPI serving layer (7 endpoints)
+│   └── main.py              # FastAPI serving layer (8 endpoints)
 ├── dags/
-│   └── edgar_pipeline.py    # Airflow DAG (8-task pipeline)
+│   └── edgar_pipeline.py    # Airflow DAG (9-task pipeline)
 ├── scripts/
 │   ├── backfill.py          # CLI: historical ingestion by CIK + date range
 │   ├── validate.py          # CLI: run quality checks for a given run_id
 │   ├── train_model.py       # CLI: train + register (+ optionally promote) a model
-│   └── evaluate_model.py    # CLI: CI gate — floors + regression vs. promoted model
+│   ├── evaluate_model.py    # CLI: CI gate — floors + regression vs. promoted model
+│   ├── verify_audit_chain.py # CLI: recompute and verify the extraction hash chain
+│   └── benchmark_pipeline.py # CLI: end-to-end timing in mock mode (`make benchmark`)
 ├── migrations/               # Alembic migration environment + versions
-├── tests/                    # pytest suite — 363 tests, 77% coverage on gated modules
+├── metrics/                  # Append-only per-run metrics log
+├── docs/
+│   ├── API_CONTRACTS.md      # Endpoint reference and interface conventions
+│   ├── DECISION_LOG.md       # Defects found and how they were corrected
+│   ├── AUDIT_TRAIL_PLAN.md   # Design record for the hash-chained audit trail
+│   └── MICROSERVICE_ALTERNATIVE.md # Why this is a monolith, and the split alternative
+├── tests/                    # pytest suite — 501 tests, 80% coverage on gated modules
 ├── .github/workflows/        # ci.yml, ml.yml, cd.yml
 ├── Dockerfile                 # Multi-stage build, non-root runtime
 ├── docker-compose.yml         # PostgreSQL 16 + Redis 7
@@ -142,6 +190,7 @@ sec-edgar-extraction-pipeline/
 ├── requirements.txt / requirements-dev.txt
 ├── alembic.ini
 ├── AGENTS.md                  # Architecture spec + build notes for contributors/agents
+├── MODEL_CARD.md              # Anomaly model: intended use, limits, evaluation method
 └── README.md
 ```
 
@@ -271,7 +320,7 @@ Tagged releases (`vX.Y.Z`) are built and pushed to GHCR automatically by `.githu
 ## Testing
 
 ```bash
-pytest tests/ -v                        # full suite (482 tests) — see "By the Numbers" for the per-module breakdown
+pytest tests/ -v                        # full suite (501 tests) — see "By the Numbers" for the per-module breakdown
 pytest tests/test_api.py -v             # endpoints + caching behavior
 pytest tests/test_client.py -v          # rate limiting, retry/backoff
 pytest tests/test_parser.py -v          # XBRL extraction, units, periods
@@ -316,6 +365,42 @@ The bullets below state conclusions. [`docs/DECISION_LOG.md`](docs/DECISION_LOG.
 - **Drift-aware quality gates, on facts and on the model.** PSI on extracted fact distributions flags data quality regressions before they reach the warehouse; the same PSI machinery, reused rather than reimplemented, monitors the anomaly model's own feature and prediction distributions for drift.
 - **A real DAG-import test, not just a mocked one.** `tests/test_dag.py` mocks Airflow away for fast structural tests, which once let an Airflow-3-incompatible DAG pass 131/131 tests while failing to import in production. `tests/test_dag_import.py` imports the module in a subprocess against whatever Airflow is actually installed, specifically to close that gap.
 
+## Where This Fits
+
+SEC filings contain two kinds of data, and they need two different extraction
+strategies. This repository handles the first; a sibling repository handles the
+second.
+
+**Tagged facts — this repository.** Roughly the core financial statements:
+figures the filer machine-tagged in iXBRL. Because the markup declares the
+concept, unit, scale, and period, extraction is *deterministic* — `lxml` reads
+the tags, and every value traces to a specific element in a specific document.
+There is no model, so there is no hallucination risk, and the hash-chained audit
+trail makes any post-hoc alteration detectable.
+
+**Untagged prose — [Fine-Tuned-SEC-Filing-Extraction-Pipeline](https://github.com/A-Kuo/Fine-Tuned-SEC-Filing-Extraction-Pipeline).**
+Everything the tagging does not reach: figures quoted in MD&A, footnote detail,
+non-GAAP reconciliations, narrative tables. No markup declares what those numbers
+mean, so deterministic parsing cannot recover them. That repository fine-tunes
+Llama 3.1 8B with QLoRA to extract them, and evaluates the result the way a
+probabilistic extractor has to be evaluated.
+
+The split is deliberate rather than accidental. The two halves have different
+correctness criteria (verifiable against source markup vs. measured against a
+held-out set), different infrastructure (scheduled CPU batch jobs vs. GPU
+inference serving), and different failure modes. Merging them would put a
+multi-gigabyte CUDA dependency stack inside an Airflow worker image and force one
+CI pipeline to gate two unrelated notions of "correct."
+
+### Related repositories
+
+| Repository | Role |
+|---|---|
+| [Fine-Tuned-SEC-Filing-Extraction-Pipeline](https://github.com/A-Kuo/Fine-Tuned-SEC-Filing-Extraction-Pipeline) | QLoRA fine-tuned Llama 3.1 8B — extracts from untagged filing prose |
+| [Transformer-Aspect-Based-Sentiment-Analysis](https://github.com/A-Kuo/Transformer-Aspect-Based-Sentiment-Analysis) | Aspect-level sentiment over MD&A and risk-factor text |
+| [Financial-Economic-Ticker-Analyzer-Agent](https://github.com/A-Kuo/Financial-Economic-Ticker-Analyzer-Agent) | Market-intelligence enrichment keyed on extracted ticker |
+| [Agentic-Visualization-Framework](https://github.com/A-Kuo/Agentic-Visualization-Framework) | Dashboard generation over the structured output |
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow, and [AGENTS.md](AGENTS.md) for the architecture spec, schema definitions, and implementation notes. This project follows a [Code of Conduct](CODE_OF_CONDUCT.md).
@@ -349,4 +434,4 @@ Issues and questions: [GitHub Issues](https://github.com/A-Kuo/sec-edgar-extract
 
 ---
 
-**Status:** Core pipeline, ML anomaly-detection layer, model registry, and CI/CD (lint/typecheck/test, model train+gate, Docker build+push to GHCR) complete — 363 tests, 77% coverage on CI-gated modules | **Last updated:** August 2026
+**Status:** Core pipeline, ML anomaly-detection layer, model registry, and CI/CD (lint/typecheck/test, model train+gate, Docker build+push to GHCR) complete — 501 tests, 80% coverage on CI-gated modules | **Last updated:** August 2026

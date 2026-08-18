@@ -1,0 +1,26 @@
+# Normalise line endings on checkin; check out native.
+* text=auto
+
+# Explicit text types
+*.py    text diff=python
+*.md    text
+*.yml   text
+*.yaml  text
+*.json  text
+*.toml  text
+*.cfg   text
+*.ini   text
+*.sql   text
+Makefile text
+Dockerfile text
+
+# Binary — never diff or normalise
+*.png   binary
+*.jpg   binary
+*.joblib binary
+*.pkl   binary
+
+# Keep generated/vendored files out of language stats and diffs
+migrations/versions/*.py linguist-generated=true
+docs/images/*           linguist-documentation=true
+*.ipynb                 linguist-documentation=true

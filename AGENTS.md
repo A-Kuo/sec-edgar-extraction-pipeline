@@ -15,11 +15,12 @@ For *why* the system looks the way it does — real defects found and corrected,
 ```
 sec-edgar-extraction-pipeline/
 ├── dags/
-│   └── edgar_pipeline.py       # Airflow DAG (8 tasks, incl. score_anomalies)
+│   └── edgar_pipeline.py       # Airflow DAG (9 tasks, incl. score_anomalies)
 ├── src/
 │   ├── edgar_client.py         # EDGAR API wrapper (rate-limited, retry)
 │   ├── xbrl_parser.py          # XBRL/HTML fact extraction
-│   ├── schema.py               # SQLAlchemy models (6 tables)
+│   ├── schema.py               # SQLAlchemy models (7 tables)
+│   ├── metrics.py              # Per-run metrics aggregation (collect_run_metrics)
 │   ├── quality.py              # completeness + PSI drift checks
 │   ├── cache.py                # Redis caching layer
 │   ├── alerts.py                # Slack/SMTP alerting hooks
@@ -32,7 +33,7 @@ sec-edgar-extraction-pipeline/
 │       ├── evaluation.py        # corruption injection, the CI gate's metrics
 │       └── synthetic.py         # seeded filing generator (CI has no DB)
 ├── api/
-│   └── main.py                 # FastAPI serving layer (7 endpoints)
+│   └── main.py                 # FastAPI serving layer (8 endpoints)
 ├── scripts/
 │   ├── backfill.py             # historical ingestion CLI
 │   ├── validate.py             # manual quality-check CLI
@@ -279,7 +280,7 @@ Filing and fact reads check Redis before PostgreSQL. `/anomalies` and `/model/cu
 When handing this project to another contributor or agent, update this section:
 
 **Last updated:** August 2026
-**Current state:** Core pipeline, ML anomaly-detection layer, model registry, idempotent DB writes (`src/upsert.py`), jittered retry backoff, the hash-chained per-accession audit trail (`src/audit.py`, `extraction_audit`), and CI/CD (lint/typecheck/test/DAG-import/migrations/Postgres-trigger verification, model train+gate, Docker build+push) are all implemented and passing. 482 tests.
+**Current state:** Core pipeline, ML anomaly-detection layer, model registry, idempotent DB writes (`src/upsert.py`), jittered retry backoff, the hash-chained per-accession audit trail (`src/audit.py`, `extraction_audit`), and CI/CD (lint/typecheck/test/DAG-import/migrations/Postgres-trigger verification, model train+gate, Docker build+push) are all implemented and passing. 501 tests.
 
 **Next steps (not yet done):**
 - Production deployment guide beyond the container image (no Kubernetes/Helm config exists yet)

@@ -95,6 +95,9 @@ down: ## Stop PostgreSQL and Redis
 logs: ## Tail service logs
 	docker compose logs -f
 
+api: ## Serve the FastAPI app locally on port 8000
+	uvicorn api.main:app --reload --port 8000
+
 docker-build: ## Build the application image
 	docker build -t sec-edgar-pipeline:local .
 
