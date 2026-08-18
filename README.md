@@ -4,24 +4,26 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Docker Ready](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
 
-> A data engineering pipeline that ingests SEC 10-K/10-Q filings, extracts structured financial facts from XBRL, validates data quality, serves the results through a caching API, and answers citation-grounded questions over the filing text itself.
+> A data engineering pipeline that ingests SEC 10-K/10-Q filings from EDGAR, extracts structured financial facts from iXBRL tags, validates data quality, and serves the results through a cached API. Every extracted fact is deterministically parsed from machine-tagged XBRL data — no language model, no prose extraction.
+
+**Scope:** This repo owns **tagged-XBRL extraction only**. Extraction from unstructured narrative (MD&A, footnotes, non-GAAP reconciliations, untagged tables) belongs to a separate repository ([Fine-Tuned-SEC-Filing-Extraction-Pipeline](docs/BOUNDARY.md)). See [docs/BOUNDARY.md](docs/BOUNDARY.md) for the full scope contract, precedence rules, and handoff surface.
 
 ## Problem
 
-SEC filings are published as unstructured HTML/XBRL documents. Pulling a single metric — revenue, net income, total assets — for a set of companies over time means manually locating filings, parsing inconsistent markup, and reconciling amendments. This doesn't scale past a handful of one-off lookups.
+SEC filings contain machine-tagged financial data in iXBRL format, but pulling a single metric — revenue, net income, total assets — for a set of companies over time still means manually locating filings, parsing inconsistent markup, and reconciling amendments. This doesn't scale past a handful of one-off lookups.
 
 ## Solution
 
-This pipeline automates the full path from raw filing to queryable, versioned financial data:
+This pipeline automates the full path from raw filing to queryable, versioned financial data — for the subset of facts that filers have explicitly tagged in iXBRL:
 
 1. **Ingest** — an SEC EDGAR API client (rate-limited, retrying) pulls filing metadata and raw documents by CIK/ticker.
-2. **Parse** — an XBRL parser extracts a fixed set of financial facts (revenue, net income, assets, liabilities, EPS, etc.), normalizing units and period types.
+2. **Parse** — an iXBRL parser extracts a fixed set of tagged financial facts (revenue, net income, assets, liabilities, EPS, etc.), normalizing units and period types. Only machine-tagged data is extracted; numbers embedded in prose are out of scope.
 3. **Validate** — a quality layer checks field completeness against a threshold and flags statistical drift (PSI) in extracted values before anything is trusted downstream.
 4. **Store** — validated facts land in PostgreSQL with an append-only audit trail and amendment-aware version history.
 5. **Serve** — a FastAPI layer exposes filings and time-series facts, backed by a Redis cache.
-6. **Research** — a retrieval layer chunks filing text into Item-level sections and answers natural-language questions with citations back to the specific accession and section, refusing to answer when nothing in the indexed filings actually supports it.
+6. **Look up** — a lightweight filing-text search tool (`/ask/{ticker}`) helps users find and quote relevant passages from filing text, with citations back to the specific accession and section. This is a read-only research aid — it does not extract structured facts.
 
-The structured-extraction pipeline (steps 1-5) is orchestrated end-to-end by an Airflow DAG and runs entirely deterministically — no LLM is involved. The retrieval layer (step 6) is the one place an LLM can optionally participate, and only to *phrase* an answer already constrained to retrieved filing text — never to originate facts. See [Retrieval &amp; Q&amp;A](#retrieval--qa) below.
+The extraction pipeline (steps 1–5) is orchestrated end-to-end by an Airflow DAG and runs entirely deterministically — no LLM is involved. The lookup tool (step 6) can optionally use an LLM to *phrase* a quoted answer, but never to originate or extract facts.
 
 ## Architecture
 
@@ -60,14 +62,16 @@ SEC EDGAR API
 
 ```
 sec-edgar-extraction-pipeline/
+├── docs/
+│   └── BOUNDARY.md          # Scope contract: this repo vs. the LLM extraction repo
 ├── src/
 │   ├── schema.py           # SQLAlchemy ORM models (4 tables)
 │   ├── edgar_client.py     # EDGAR API client (rate-limited, retry with backoff)
-│   ├── xbrl_parser.py      # XBRL HTML -> financial fact extraction
+│   ├── xbrl_parser.py      # iXBRL tag extraction (deterministic, no ML)
 │   ├── quality.py          # Completeness checks + PSI drift detection
 │   ├── cache.py            # Redis caching (CIK, filing index, facts)
 │   ├── alerts.py           # Slack/SMTP alerting on pipeline failure
-│   └── rag/
+│   └── rag/                # Filing-text lookup aid (read-only, not extraction)
 │       ├── chunker.py       # Filing text -> provenance-tagged chunks
 │       ├── retrieval.py     # TF-IDF retrieval over chunks
 │       ├── qa.py            # Citation-first answer construction
@@ -144,7 +148,9 @@ curl http://localhost:8000/facts/AAPL/Revenues
 curl -X POST http://localhost:8000/trigger/AAPL
 ```
 
-### Retrieval &amp; Q&amp;A
+### Filing-text lookup (`/ask`)
+
+> **Not an extraction endpoint.** `/ask` is a read-only research aid that helps users find and quote relevant passages from filing text. It does not extract structured facts, does not write to `financial_facts`, and is not the narrative extraction system — see [docs/BOUNDARY.md](docs/BOUNDARY.md).
 
 ```bash
 curl -G http://localhost:8000/ask/AAPL --data-urlencode "q=What supply chain risk does the company describe?"
@@ -169,7 +175,7 @@ curl -G http://localhost:8000/ask/AAPL --data-urlencode "q=What is the CEO's fav
 # {"grounded": false, "answer": "I do not find support for this in the supplied filings.", "citations": []}
 ```
 
-Run the evaluation harness (retrieval recall@k, citation validity, refusal accuracy) against the seed question set:
+Run the lookup-aid evaluation harness (retrieval recall@k, citation validity, refusal accuracy) against the seed question set:
 
 ```bash
 pytest tests/test_rag.py::TestEvaluationHarness -v
@@ -247,7 +253,7 @@ Every task writes a start/end row to `pipeline_audit`, which is append-only — 
 | `test_parser.py` | 34 | XBRL extraction — units, periods, segments, amendment supersession |
 | `test_quality.py` | 28 | Completeness thresholds, PSI drift detection edge cases |
 | `test_dag.py` | 23 | DAG task wiring, mock-mode task callables, alerting trigger rule |
-| `test_rag.py` | 15 | Chunking, TF-IDF retrieval, citation-first QA, evaluation harness |
+| `test_rag.py` | 15 | Filing-text lookup aid: chunking, TF-IDF retrieval, citation QA, evaluation harness |
 | `test_client.py` | 14 | Rate limiting, retry/backoff, 429/503 handling |
 | `test_load_idempotency.py` | 6 | UPSERT dedup on retry/reprocessing, NULL-safety |
 | `test_analytics_marts.py` | 5 | `fct_company_year(_yoy)` views against the real migration |
@@ -267,7 +273,7 @@ pytest tests/test_client.py -v       # rate limiting, retry/backoff
 pytest tests/test_parser.py -v       # XBRL extraction, units, periods
 pytest tests/test_quality.py -v      # completeness + PSI edge cases
 pytest tests/test_dag.py -v          # DAG structure and task wiring
-pytest tests/test_rag.py -v          # chunking, retrieval, citation-first QA, eval harness
+pytest tests/test_rag.py -v          # filing-text lookup aid: chunking, retrieval, citation QA, eval harness
 pytest tests/test_load_idempotency.py -v  # idempotent UPSERT into financial_facts
 pytest tests/test_backfill.py -v     # backfill checkpoint persistence, --resume/--since-last-run filtering
 pytest tests/test_analytics_marts.py -v  # fct_company_year / fct_company_year_yoy views (real migration, real SQL)
@@ -286,17 +292,18 @@ Tests run against an in-memory SQLite database and a mocked Redis client, with `
 | `MOCK_EDGAR` | `false` | Set `true` for local dev/tests to use fixture data instead of live calls |
 | `SLACK_WEBHOOK_URL` | unset | Optional Slack alerting on pipeline failure |
 | `SMTP_HOST`, `ALERT_EMAIL_TO` | unset | Optional email alerting on pipeline failure |
-| `OPENAI_API_KEY` | unset | Optional — enables LLM-phrased answers in `/ask`. Without it, answers are extractive (quoted directly from the retrieved chunk); this is the default and what tests exercise |
+| `OPENAI_API_KEY` | unset | Optional — enables LLM-phrased answers in the `/ask` lookup aid. Without it, answers are extractive (quoted directly from the retrieved chunk); this is the default and what tests exercise. The LLM only phrases the answer — it never extracts or originates facts. |
 
 ## Key Design Decisions
 
-- **No LLM in the extraction path.** XBRL parsing is deterministic (`lxml`), so extraction is reproducible and carries no hallucination risk.
+- **Tagged-XBRL extraction only.** This repo extracts facts that SEC filers have explicitly machine-tagged in iXBRL. Extraction from unstructured narrative (MD&A, footnotes, non-GAAP tables) belongs to a separate repo — see [docs/BOUNDARY.md](docs/BOUNDARY.md).
+- **No LLM in the extraction path.** iXBRL parsing is deterministic (`lxml`), so extraction is reproducible and carries no hallucination risk. No model inference, no embeddings, no ML dependencies in the extraction pipeline.
 - **Append-only audit trail.** `pipeline_audit` is never updated or deleted from — it's a permanent record of every pipeline run.
 - **Cache-first API.** Every read endpoint checks Redis first and falls back to PostgreSQL, with graceful degradation if Redis is unavailable.
 - **Rate-limited ingestion.** A token-bucket limiter keeps requests to SEC EDGAR at or below 10 req/s, per their access guidelines.
 - **Drift-aware quality gates.** PSI (Population Stability Index) on extracted fact distributions flags data quality regressions before they reach the warehouse, not after.
-- **Retrieval, not a chatbot.** `/ask` refuses to answer (`grounded: false`) when nothing in the indexed filings scores above a relevance threshold, instead of always producing a confident-sounding response. See "Known failure modes" below for where this still falls short.
-- **TF-IDF over embeddings for retrieval.** The corpus size this project targets (a scoped watchlist of tickers, not all of EDGAR) doesn't need a vector index or GPU dependency. TF-IDF is deterministic, runs offline, and keeps the test suite fast and network-free.
+- **Lookup aid, not a chatbot.** `/ask` is a read-only filing-text search tool, not an extraction system. It refuses to answer (`grounded: false`) when nothing in the indexed filings scores above a relevance threshold, instead of always producing a confident-sounding response. See "Known failure modes" below for where this still falls short.
+- **TF-IDF over embeddings for the lookup aid.** The corpus size this project targets (a scoped watchlist of tickers, not all of EDGAR) doesn't need a vector index or GPU dependency. TF-IDF is deterministic, runs offline, and keeps the test suite fast and network-free. No ML model is loaded or trained.
 
 ## Known Failure Modes and Mitigations
 
@@ -304,8 +311,8 @@ Tests run against an in-memory SQLite database and a mocked Redis client, with `
 |---|---|---|
 | Out-of-scope questions about a *different* company can score above the grounding threshold | Pure lexical retrieval matches shared financial boilerplate ("fiscal 2024", "net sales") even when the entity is wrong | `/ask/{ticker}` scopes the index to one ticker's ingested filings, so cross-entity confusion mostly can't occur through the API; it remains a real limitation of the retriever used in isolation (see `AGENTS.md`) |
 | Citation snippet doesn't contain the supporting sentence | Naive truncation from the start of a chunk cuts off the fact past a heading/boilerplate opener | Citations are built around the sentence with the highest term overlap with the question, not the chunk's first sentence (`_best_sentence_window` in `src/rag/qa.py`) |
-| `download_raw_documents` currently persists the filing *index* page, not the primary document body | Simplification in the initial ingestion implementation | Tracked as a known gap — `/ask` and the RAG tests operate on realistic narrative fixtures; production `raw_html` content needs this fixed before `/ask` returns useful answers against real ingested data |
-| Retrieval quality degrades on very small corpora (few ingested filings for a ticker) | TF-IDF needs enough documents for IDF weighting to be meaningful | `max_df` filtering was intentionally left disabled to avoid `sklearn` errors on single-chunk corpora; expect noisier ranking until a ticker has several filings ingested |
+| `download_raw_documents` currently persists the filing *index* page, not the primary document body | Simplification in the initial ingestion implementation | Tracked as a known gap — `/ask` and the lookup-aid tests operate on realistic narrative fixtures; production `raw_html` content needs this fixed before `/ask` returns useful results against real ingested data. Also blocks the LLM repo from consuming real filing text. |
+| Lookup-aid quality degrades on very small corpora (few ingested filings for a ticker) | TF-IDF needs enough documents for IDF weighting to be meaningful | `max_df` filtering was intentionally left disabled to avoid `sklearn` errors on single-chunk corpora; expect noisier ranking until a ticker has several filings ingested |
 
 ## Contributing
 
@@ -325,4 +332,4 @@ Issues and questions: [GitHub Issues](https://github.com/A-Kuo/sec-edgar-extract
 
 ---
 
-**Status:** Core pipeline complete (ingestion, parsing, quality, caching, API, DAG, tests); citation-grounded retrieval layer (`/ask`) added | **Last updated:** August 2026
+**Status:** Core pipeline complete (ingestion, iXBRL parsing, quality, caching, API, DAG, tests); filing-text lookup aid (`/ask`) included | **Scope:** Tagged-XBRL extraction only — see [docs/BOUNDARY.md](docs/BOUNDARY.md) | **Last updated:** August 2026
