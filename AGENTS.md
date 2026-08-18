@@ -2,7 +2,7 @@
 
 Architecture spec and build notes for contributors (human or AI) working on this repository. This project is a **data engineering / ingestion system** that extracts **only iXBRL-tagged financial facts** — deterministic, machine-readable data that the SEC filer explicitly tagged. There is no model training, fine-tuning, or LLM in the extraction path.
 
-**Scope boundary:** This repo owns tagged-XBRL extraction only. Extraction from unstructured narrative (MD&A, footnotes, non-GAAP reconciliations, untagged tables) belongs to the separate **Fine-Tuned-SEC-Filing-Extraction-Pipeline** repository. See [docs/BOUNDARY.md](docs/BOUNDARY.md) for the full scope contract, precedence rules, and handoff surface between the two repos.
+**Scope boundary:** This repo owns tagged-XBRL extraction only. Extraction from unstructured narrative (MD&A, footnotes, non-GAAP reconciliations, untagged tables) belongs to the separate **Fine-Tuned-SEC-Filing-Extraction-Pipeline** repository. See [docs/BOUNDARY.md](docs/BOUNDARY.md) for the full scope contract, precedence rules, and handoff surface between the two repos. For agent-specific conventions (branch naming, commit rules, multi-repo routing), see [.cursor/rules/REPO_BOUNDARY.md](.cursor/rules/REPO_BOUNDARY.md).
 
 ## Overview
 
@@ -14,6 +14,9 @@ Architecture spec and build notes for contributors (human or AI) working on this
 
 ```
 sec-edgar-extraction-pipeline/
+├── .cursor/
+│   └── rules/
+│       └── REPO_BOUNDARY.md     # Agent conventions: branch naming, routing, shared DB
 ├── docs/
 │   └── BOUNDARY.md              # Scope contract: this repo vs. the LLM extraction repo
 ├── dags/

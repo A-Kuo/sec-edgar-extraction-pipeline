@@ -160,6 +160,39 @@ Optional. The LLM repo may read audit rows to determine whether
 a given filing has been fully ingested and validated before
 attempting extraction.
 
+## Shared database — table ownership
+
+Both repos write to the same PostgreSQL instance. Table ownership
+is strict: each table has exactly one writer.
+
+### This repo owns
+
+| Table | Purpose |
+|-------|---------|
+| `filings_raw` | Raw HTML/XBRL landing zone, one row per accession |
+| `financial_facts` | Parsed iXBRL facts (implicitly `method='xbrl'`) |
+| `filing_versions` | Amendment chain tracking |
+| `pipeline_audit` | Append-only audit trail for XBRL pipeline stages |
+
+### LLM repo owns
+
+| Table | Purpose |
+|-------|---------|
+| `llm_inference_log` | LLM extraction run metadata |
+| `narrative_facts_table` | Facts extracted from unstructured prose (`method='llm'`) |
+
+### Cross-repo run coordination
+
+When a task spans both repos (e.g. "extract all facts from filing
+ABC123"), both pipelines use the same `run_id`. The XBRL pipeline
+records its stages in `pipeline_audit`; the LLM pipeline records
+its stages in `llm_inference_log`. Before merging either repo,
+verify that timestamps are sequential and both sides completed
+for any shared `run_id`.
+
+Coordination metadata lives in `run_metadata.json` (checked by
+both repos' test suites).
+
 ## What this repo does NOT provide
 
 - **No client library for the LLM repo.** The handoff surface is
@@ -175,3 +208,8 @@ attempting extraction.
 - **No ML dependencies or GPU infra.** This repo runs on commodity
   hardware with no GPU requirement. The LLM repo owns all model
   serving infrastructure.
+
+## Agent conventions
+
+For branch naming, commit rules, and multi-repo routing, see
+[.cursor/rules/REPO_BOUNDARY.md](../.cursor/rules/REPO_BOUNDARY.md).
