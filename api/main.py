@@ -1,19 +1,24 @@
 """
 FastAPI serving layer for the SEC EDGAR extraction pipeline.
 
+This API serves iXBRL-tagged financial facts extracted deterministically
+from SEC filings. It does not perform narrative/prose extraction — that
+belongs to a separate repo. See docs/BOUNDARY.md for the scope contract.
+
 Endpoints
 ---------
   GET  /health
   GET  /filings/{ticker}            list filings with metadata (paginated)
-  GET  /filing/{accession}          parsed financial_facts for one filing
-  GET  /facts/{ticker}/{fact_name}  time-series of a specific fact
-  GET  /ask/{ticker}                citation-grounded Q&A over a ticker's filing text
+  GET  /filing/{accession}          parsed XBRL facts for one filing
+  GET  /facts/{ticker}/{fact_name}  time-series of a specific XBRL fact
+  GET  /ask/{ticker}                filing-text lookup aid (read-only, quotes prose + citation)
   POST /trigger/{ticker}            trigger on-demand ingestion
 
 All read endpoints check Redis before hitting PostgreSQL.
 Cache misses populate Redis so subsequent calls are served from memory.
-/ask builds its retrieval index on demand from filings_raw (see src/rag/)
-rather than caching it -- see AGENTS.md for the tradeoff.
+/ask is a read-only lookup tool -- it retrieves and quotes existing filing
+prose for human review. It does not extract structured facts or write to
+financial_facts. See docs/BOUNDARY.md.
 
 Run with:
     uvicorn api.main:app --reload
@@ -45,8 +50,10 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="SEC EDGAR Extraction Pipeline API",
     description=(
-        "Serves structured financial facts ingested from SEC EDGAR 10-K/10-Q filings. "
-        "All read endpoints use a Redis cache (TTL per key type) before hitting PostgreSQL."
+        "Serves iXBRL-tagged financial facts extracted deterministically from SEC EDGAR "
+        "10-K/10-Q filings. This API covers tagged-XBRL extraction only; narrative/prose "
+        "extraction belongs to a separate system. All read endpoints use a Redis cache "
+        "(TTL per key type) before hitting PostgreSQL."
     ),
     version="1.0.0",
     docs_url="/docs",
@@ -317,9 +324,9 @@ def list_filings(
 @app.get(
     "/filing/{accession}",
     response_model=FilingFactsResponse,
-    summary="Get parsed facts for one filing",
+    summary="Get parsed XBRL facts for one filing",
     description=(
-        "Returns all parsed financial facts for the given accession number. "
+        "Returns all iXBRL-tagged financial facts parsed for the given accession number. "
         "Facts are cached in Redis for 7 days once computed."
     ),
     tags=["filings"],
@@ -395,9 +402,9 @@ def get_filing_facts(
 @app.get(
     "/facts/{ticker}/{fact_name}",
     response_model=TimeSeriesResponse,
-    summary="Time-series for a specific financial fact",
+    summary="Time-series for a specific iXBRL-tagged fact",
     description=(
-        "Returns the full historical time-series of one XBRL fact for a given ticker. "
+        "Returns the full historical time-series of one iXBRL-tagged fact for a given ticker. "
         "Only consolidated rows (segment IS NULL) are returned by default. "
         "Results are ordered by period_end ascending. "
         "Cached per accession in Redis; lookup is assembled across cached fact sets."
@@ -469,15 +476,17 @@ def get_fact_time_series(
 @app.get(
     "/ask/{ticker}",
     response_model=AskResponse,
-    summary="Ask a citation-grounded question about a ticker's filings",
+    summary="Filing-text lookup: find and quote relevant passages",
     description=(
-        "Retrieves the most relevant sections across a ticker's ingested filing text "
-        "(TF-IDF over Item-level chunks) and returns a citation-first answer. "
-        "If nothing in the indexed filings is relevant enough, returns grounded=false "
-        "with a refusal message instead of guessing — this is a retrieval-grounded "
-        "research aid, not a general chatbot. No filing text indexed, no answer."
+        "A read-only lookup tool that retrieves the most relevant sections across a "
+        "ticker's ingested filing text (TF-IDF over Item-level chunks) and returns a "
+        "citation-first answer quoting the filing prose. This is a research aid for "
+        "navigating filing text, NOT an extraction endpoint — it does not produce "
+        "structured facts or write to financial_facts. If nothing in the indexed "
+        "filings is relevant enough, returns grounded=false with a refusal message "
+        "instead of guessing."
     ),
-    tags=["research"],
+    tags=["lookup"],
 )
 def ask_question(
     ticker: str,

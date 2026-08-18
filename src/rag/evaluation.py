@@ -1,12 +1,16 @@
 """
-Evaluation harness for the retrieval + QA layer.
+Evaluation harness for the filing-text lookup aid.
 
-Reports the metrics recommended for regulatory-domain RAG systems --
-retrieval recall@k, citation validity, and grounding-decision accuracy
-on deliberately unsupported questions -- rather than a single
-"accuracy" number. "Did it answer correctly" is meaningless here
-without also measuring "did it correctly decline to answer when it
-shouldn't have."
+Part of a read-only filing-text search tool (``/ask/{ticker}``). This
+evaluates the lookup aid's ability to find relevant passages and refuse
+gracefully when nothing is relevant — it does not evaluate fact
+extraction. See ``docs/BOUNDARY.md`` for the scope contract.
+
+Reports retrieval recall@k, citation validity, and grounding-decision
+accuracy on deliberately unsupported questions -- rather than a single
+"accuracy" number. "Did it find the right passage" is meaningless here
+without also measuring "did it correctly decline when nothing was
+relevant."
 """
 
 from __future__ import annotations

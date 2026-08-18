@@ -1,5 +1,10 @@
 """
-TF-IDF retrieval over filing chunks.
+TF-IDF retrieval over filing chunks for the lookup aid.
+
+Part of a read-only filing-text search tool (``/ask/{ticker}``). This
+is NOT an extraction component — it retrieves existing filing prose for
+human review, it does not extract structured facts or write to any
+table. See ``docs/BOUNDARY.md`` for the scope contract.
 
 Deterministic and fully offline: no embedding API call or model
 download is required, which keeps retrieval reproducible in CI and

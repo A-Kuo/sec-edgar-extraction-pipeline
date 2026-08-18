@@ -1,5 +1,10 @@
 """
-Citation-first question answering over retrieved filing chunks.
+Citation-first answer construction for the filing-text lookup aid.
+
+Part of a read-only filing-text search tool (``/ask/{ticker}``). This
+is NOT an extraction component — it quotes existing filing prose for
+human review, it does not extract structured facts or write to any
+table. See ``docs/BOUNDARY.md`` for the scope contract.
 
 Design intent
 -------------
@@ -16,6 +21,8 @@ Two answer paths:
      model to phrase the answer in prose, constrained to only the
      retrieved chunk text. Falls back to (1) on any error or missing
      key, so the feature never requires network access to function.
+     The LLM only phrases the answer; it never extracts or originates
+     facts.
 """
 
 from __future__ import annotations

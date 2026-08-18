@@ -2,7 +2,10 @@
 Airflow DAG: edgar_pipeline
 ===========================
 
-Daily ETL that ingests SEC 10-K / 10-Q filings into the data warehouse.
+Daily ETL that ingests SEC 10-K / 10-Q filings and extracts iXBRL-tagged
+financial facts into the data warehouse. This pipeline handles tagged-XBRL
+extraction only — extraction from unstructured narrative belongs to a
+separate repo. See ``docs/BOUNDARY.md`` for the scope contract.
 
 Task chain
 ----------

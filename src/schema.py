@@ -1,9 +1,16 @@
 """
 SQLAlchemy ORM models for the SEC EDGAR extraction pipeline.
 
+This schema stores iXBRL-tagged financial facts extracted deterministically
+from SEC filings. All rows in ``financial_facts`` are currently
+``method='xbrl'`` (implicit — no column yet). When the LLM extraction repo
+is ready to write ``method='llm'`` facts, a ``method`` column (plus
+``confidence``, ``model_version``) should be added via migration. See
+``docs/BOUNDARY.md`` for the precedence rule and handoff surface.
+
 Tables:
   filings_raw      — raw HTML/XBRL landing zone, keyed by accession_number
-  financial_facts  — parsed fact rows referencing filings_raw
+  financial_facts  — parsed iXBRL fact rows referencing filings_raw
   filing_versions  — immutable version history tracking amendments
   pipeline_audit   — append-only stage-level audit trail
 """
