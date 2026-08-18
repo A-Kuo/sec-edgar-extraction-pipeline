@@ -1,27 +1,31 @@
 # AGENTS.md — SEC EDGAR Extraction Pipeline
 
-Architecture spec and build notes for contributors (human or AI) working on this repository. This project is a **data engineering / ingestion system** — there is no model training, fine-tuning, or LLM in the extraction path.
+Architecture spec and build notes for contributors (human or AI) working on this repository. This project is a **data engineering / ingestion system** that extracts **only iXBRL-tagged financial facts** — deterministic, machine-readable data that the SEC filer explicitly tagged. There is no model training, fine-tuning, or LLM in the extraction path.
+
+**Scope boundary:** This repo owns tagged-XBRL extraction only. Extraction from unstructured narrative (MD&A, footnotes, non-GAAP reconciliations, untagged tables) belongs to the separate **Fine-Tuned-SEC-Filing-Extraction-Pipeline** repository. See [docs/BOUNDARY.md](docs/BOUNDARY.md) for the full scope contract, precedence rules, and handoff surface between the two repos.
 
 ## Overview
 
-**Purpose:** Ingest SEC 10-K/10-Q filings from EDGAR, extract structured financial facts from XBRL, validate data quality, and serve the results through a cached API — all orchestrated by Airflow.
+**Purpose:** Ingest SEC 10-K/10-Q filings from EDGAR, extract structured financial facts from iXBRL tags, validate data quality, and serve the results through a cached API — all orchestrated by Airflow. Every fact this pipeline produces is deterministically parsed from machine-tagged XBRL data; no fact is ever inferred from prose.
 
-**Status:** Core pipeline implemented — EDGAR client, XBRL parser, schema + migrations, quality checks, Redis cache, Airflow DAG, FastAPI layer, and test suite are all in place. A citation-grounded retrieval layer (`src/rag/`, served via `GET /ask/{ticker}`) sits on top of the structured pipeline as an optional research aid — see [README.md](README.md) for setup and usage.
+**Status:** Core pipeline implemented — EDGAR client, XBRL parser, schema + migrations, quality checks, Redis cache, Airflow DAG, FastAPI layer, and test suite are all in place. A lightweight filing-text lookup aid (`src/rag/`, served via `GET /ask/{ticker}`) sits on top of the structured pipeline as a read-only research tool for navigating filing prose — it does not extract structured facts and is not the narrative extraction system (see [docs/BOUNDARY.md](docs/BOUNDARY.md)).
 
 ## Repository Structure
 
 ```
 sec-edgar-extraction-pipeline/
+├── docs/
+│   └── BOUNDARY.md              # Scope contract: this repo vs. the LLM extraction repo
 ├── dags/
 │   └── edgar_pipeline.py       # Airflow DAG
 ├── src/
 │   ├── edgar_client.py         # EDGAR API wrapper (rate-limited, retry)
-│   ├── xbrl_parser.py          # XBRL/HTML fact extraction
+│   ├── xbrl_parser.py          # iXBRL tag extraction (deterministic, no ML)
 │   ├── schema.py               # SQLAlchemy models
 │   ├── quality.py              # completeness + PSI drift checks
 │   ├── cache.py                # Redis caching layer
-│   └── alerts.py               # Slack/SMTP alerting hooks
-│   └── rag/
+│   ├── alerts.py               # Slack/SMTP alerting hooks
+│   └── rag/                    # Filing-text lookup aid (read-only, not extraction)
 │       ├── chunker.py           # Filing text -> provenance-tagged chunks
 │       ├── retrieval.py         # TF-IDF retrieval over chunks
 │       ├── qa.py                # Citation-first answer construction, refusal behavior
@@ -109,7 +113,7 @@ CREATE TABLE pipeline_audit (
 - Retries on 429/503 with exponential backoff, max 5 attempts.
 
 ### `xbrl_parser.py`
-Extracts a fixed set of target facts: `us-gaap:Revenues` (or `RevenueFromContractWithCustomerExcludingAssessedTax`), `NetIncomeLoss`, `Assets`, `Liabilities`, `OperatingIncomeLoss`, `EarningsPerShareBasic`, `CommonStockSharesOutstanding`. Handles instant vs. duration periods, unit conversion (thousands vs. millions), segment disaggregation, and amendment supersession (latest amendment wins).
+Deterministic iXBRL tag extraction — no model inference, no prose parsing. Extracts a fixed set of target facts: `us-gaap:Revenues` (or `RevenueFromContractWithCustomerExcludingAssessedTax`), `NetIncomeLoss`, `Assets`, `Liabilities`, `OperatingIncomeLoss`, `EarningsPerShareBasic`, `CommonStockSharesOutstanding`. Handles instant vs. duration periods, unit conversion (thousands vs. millions), segment disaggregation, and amendment supersession (latest amendment wins). Only processes machine-tagged XBRL data; numbers embedded in narrative prose are out of scope (see [docs/BOUNDARY.md](docs/BOUNDARY.md)).
 
 ### `dags/edgar_pipeline.py`
 Seven-task linear DAG:
@@ -129,7 +133,9 @@ Each stage writes a start/end row to `pipeline_audit`. `validate_quality_gates` 
 ### `cache.py`
 Redis key patterns: `cik:{ticker}` (TTL 1h), `filings:{cik}` (TTL 24h), `facts:{accession_number}` (TTL 7d — parsed facts don't change).
 
-### `src/rag/` — retrieval layer
+### `src/rag/` — filing-text lookup aid (read-only, not extraction)
+
+> **Scope note:** This is a lightweight read-only research tool for navigating filing prose — it helps a human find a relevant passage. It is **not** the narrative extraction system described in [docs/BOUNDARY.md](docs/BOUNDARY.md). It does not extract structured facts, does not write to `financial_facts`, and does not produce data that feeds downstream. The Fine-Tuned-SEC-Filing-Extraction-Pipeline repo owns all extraction from unstructured text.
 
 Chunks filing text into Item-level sections (`chunker.py`), retrieves the most relevant chunks for a question via TF-IDF (`retrieval.py`), and constructs a citation-first answer (`qa.py`). Deliberately **not** an embedding-based system: the target corpus size (a scoped watchlist, not all of EDGAR) doesn't need one, and TF-IDF keeps retrieval deterministic, offline, and fast to test.
 
@@ -138,22 +144,22 @@ Key behaviors, and why they exist:
 - **Refusal, not confident guessing.** `answer_question()` returns `grounded=False` and a fixed refusal string when the best retrieval score is below `MIN_GROUNDING_SCORE` (0.15). This threshold was tuned empirically against the narrative fixtures in `tests/fixtures/sample_filing_narrative_10k.html` / `_10q.html` — see the test history in `tests/test_rag.py` for the calibration process, including a real bug it caught (see below).
 - **Domain-aware stopwords.** SEC boilerplate ("fiscal", "the Company", "this Item") appears in nearly every chunk of nearly every filing and would otherwise dominate cosine similarity for out-of-scope questions that happen to mention a fiscal year. `_FILING_BOILERPLATE_STOPWORDS` in `retrieval.py` strips these before vectorizing.
 - **Sentence-level citation windows, not chunk-start truncation.** A naive `text[:280]` snippet shows the section heading and opening boilerplate, not the sentence that actually supports the answer. `_best_sentence_window()` in `qa.py` picks the sentence with the highest term overlap with the question and starts the snippet there.
-- **Optional LLM synthesis, never required.** If `OPENAI_API_KEY` is set, `_try_llm_synthesis()` asks a model to phrase the answer using *only* the retrieved chunk text. Any failure (missing key, network error, bad response) falls back to the extractive path silently — this keeps `/ask` and its tests fully offline by default.
+- **Optional LLM synthesis, never required.** If `OPENAI_API_KEY` is set, `_try_llm_synthesis()` asks a model to phrase the answer using *only* the retrieved chunk text. Any failure (missing key, network error, bad response) falls back to the extractive path silently — this keeps `/ask` and its tests fully offline by default. This is answer *phrasing*, not fact extraction — it never produces structured data or writes to any table.
 
 **Known limitation — entity disambiguation.** A lexical retriever cannot reliably tell "this is about a different company" from "this happens to share financial boilerplate vocabulary." Early testing found "What was Tesla's revenue in fiscal 2024?" scoring *above* the grounding threshold against an Apple-only corpus, purely on the strength of the shared phrase "fiscal 2024." This is mitigated at the API layer: `GET /ask/{ticker}` only ever indexes filings for the requested ticker, so cross-entity confusion mostly can't occur in practice — but the retriever module in isolation (as exercised directly in `tests/test_rag.py`) doesn't solve this itself, and its evaluation cases were revised to test genuine topic-absence (e.g. "return policy for damaged retail products") rather than cross-entity mixups, which are a different, harder problem (would need NER/entity resolution or semantic embeddings, not lexical matching).
 
-**Known limitation — `raw_html` is currently the filing index page, not the primary document.** `download_raw_documents` in `dags/edgar_pipeline.py` fetches the accession's directory-listing HTML, not the actual 10-K/10-Q document body. `/ask` and the RAG tests are validated against realistic narrative fixtures, but will need this ingestion gap closed before returning useful answers against real production data. Fixing this is a data-engineering task (locate and fetch the primary document filename from the index, not the index itself), independent of the retrieval layer.
+**Known limitation — `raw_html` is currently the filing index page, not the primary document.** `download_raw_documents` in `dags/edgar_pipeline.py` fetches the accession's directory-listing HTML, not the actual 10-K/10-Q document body. `/ask` and the lookup-aid tests are validated against realistic narrative fixtures, but will need this ingestion gap closed before returning useful results against real production data. Fixing this is a data-engineering task (locate and fetch the primary document filename from the index, not the index itself), independent of the lookup layer.
 
 ### `api/main.py`
 ```
 GET  /health
 GET  /filings/{ticker}            list filings for a ticker (paginated)
-GET  /filing/{accession}          parsed facts for one filing
-GET  /facts/{ticker}/{fact_name}  time-series of a specific fact
-GET  /ask/{ticker}                citation-grounded Q&A over the ticker's indexed filing text
+GET  /filing/{accession}          parsed XBRL facts for one filing
+GET  /facts/{ticker}/{fact_name}  time-series of a specific XBRL fact
+GET  /ask/{ticker}                filing-text lookup aid (read-only, returns quoted prose + citation)
 POST /trigger/{ticker}             trigger on-demand ingestion
 ```
-All read endpoints check Redis before PostgreSQL and return typed Pydantic models. Unknown ticker/accession returns 404 with a detail message. `/ask` builds its retrieval index on demand from `filings_raw.raw_html` per request rather than caching it — acceptable at the corpus sizes this project targets; worth revisiting (e.g. cache the fitted retriever in Redis, invalidate on new filings) if ticker filing counts grow large enough for TF-IDF fitting to become a latency concern.
+All read endpoints check Redis before PostgreSQL and return typed Pydantic models. Unknown ticker/accession returns 404 with a detail message. `/ask` is a read-only lookup tool — it retrieves and quotes filing prose for human review but does not extract structured facts or write to `financial_facts` (see [docs/BOUNDARY.md](docs/BOUNDARY.md)). It builds its retrieval index on demand from `filings_raw.raw_html` per request rather than caching it — acceptable at the corpus sizes this project targets; worth revisiting (e.g. cache the fitted retriever in Redis, invalidate on new filings) if ticker filing counts grow large enough for TF-IDF fitting to become a latency concern.
 
 ## Testing Strategy
 
@@ -175,15 +181,17 @@ All read endpoints check Redis before PostgreSQL and return typed Pydantic model
 When handing this project to another contributor or agent, update this section:
 
 **Last updated:** August 2026
-**Current state:** Core pipeline complete — ingestion, parsing, schema/migrations, quality checks, cache, DAG, API, and tests are all implemented and passing. Citation-grounded retrieval layer (`src/rag/`, `GET /ask/{ticker}`) added with an evaluation harness (`tests/test_rag.py::TestEvaluationHarness`) covering retrieval recall@k, citation validity, and grounding-decision accuracy on a 10-case seed set.
+**Scope:** This repo owns tagged-XBRL extraction only. Read [docs/BOUNDARY.md](docs/BOUNDARY.md) before making changes — it defines what belongs here vs. in the Fine-Tuned-SEC-Filing-Extraction-Pipeline repo.
+**Current state:** Core pipeline complete — ingestion, iXBRL parsing, schema/migrations, quality checks, cache, DAG, API, and tests are all implemented and passing. A lightweight filing-text lookup aid (`src/rag/`, `GET /ask/{ticker}`) is included for navigating filing prose — it is read-only and does not extract structured facts.
 
 **Next steps (not yet done):**
-- Fix `download_raw_documents` to persist the primary filing document, not the index page (blocks `/ask` from being useful against real ingested data — see "Known limitation" under `src/rag/` above)
-- Grow the RAG evaluation set from 10 seed cases toward the 25-50 recommended for a credible eval, and add cases that stress cross-document/cross-period comparative questions
+- Fix `download_raw_documents` to persist the primary filing document, not the index page (blocks the lookup aid from being useful against real ingested data, and blocks the LLM repo from consuming real filing text — see "Known limitation" under `src/rag/` above)
+- Grow the lookup-aid evaluation set from 10 seed cases toward the 25-50 recommended for a credible eval
+- Add a `method` column to `financial_facts` (+ `confidence`, `model_version`) when the LLM repo is ready to write facts — see [docs/BOUNDARY.md](docs/BOUNDARY.md) for the precedence rule
 - CI workflow (lint/type-check/test on push)
 - `.env.example` for local setup
 - Production deployment guide (current `docker-compose.yml` is local-dev only; no Kubernetes/Helm config exists yet)
-- There is separate, uncommitted work in progress on load-stage idempotency (`_upsert_facts` in `dags/edgar_pipeline.py`, a unique expression index in `src/schema.py`, plus `tests/test_load_idempotency.py`) — unrelated to the RAG layer, not touched by it, and not yet committed as of this update
+- There is separate, uncommitted work in progress on load-stage idempotency (`_upsert_facts` in `dags/edgar_pipeline.py`, a unique expression index in `src/schema.py`, plus `tests/test_load_idempotency.py`) — unrelated to the lookup aid, not touched by it, and not yet committed as of this update
 
 ## Resources
 
