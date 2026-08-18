@@ -112,6 +112,7 @@ def test_dag_exposes_expected_tasks() -> None:
     payload = json.loads(result.stdout.split("__RESULT__")[1].splitlines()[0])
 
     assert payload["task_ids"] == [
+        "collect_run_metrics",
         "download_raw_documents",
         "fetch_new_filings",
         "load_to_warehouse",

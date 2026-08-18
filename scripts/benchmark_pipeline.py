@@ -12,9 +12,10 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -44,14 +45,19 @@ def benchmark() -> None:
     """Run the pipeline end-to-end in mock mode with timing instrumentation."""
     os.environ["MOCK_EDGAR"] = "true"
 
+    # _task_timings is module-global so the decorator can reach it. Reset it
+    # here so a second call in the same interpreter reports only its own run
+    # rather than inheriting stale stages from the first.
+    _task_timings.clear()
+
     from dags.edgar_pipeline import (
-        fetch_new_filings,
         download_raw_documents,
-        parse_xbrl_facts,
-        validate_quality_gates,
-        score_anomalies,
+        fetch_new_filings,
         load_to_warehouse,
+        parse_xbrl_facts,
+        score_anomalies,
         update_audit_trail,
+        validate_quality_gates,
     )
 
     print("Benchmarking SEC EDGAR pipeline (mock mode)...\n")
@@ -86,29 +92,35 @@ def benchmark() -> None:
                 mock_context["ti"].xcom_push(key="filings", value=filings)
                 download_raw_documents(**mock_context)
             elif task_name == "parse_xbrl_facts":
-                mock_context["ti"].xcom_push(key="downloaded_accessions", value=["0000320193-24-000123", "0000320193-23-000077"])
+                mock_context["ti"].xcom_push(
+                    key="downloaded_accessions",
+                    value=["0000320193-24-000123", "0000320193-23-000077"],
+                )
                 parse_xbrl_facts(**mock_context)
             elif task_name == "validate_quality_gates":
-                mock_context["ti"].xcom_push(key="facts", value=[
-                    {
-                        "accession_number": "0000320193-24-000123",
-                        "fact_name": "us-gaap:Revenues",
-                        "fact_value": 391035000000,
-                        "unit": "USD",
-                        "period_start": "2023-10-01",
-                        "period_end": "2024-09-28",
-                        "segment": None,
-                    },
-                    {
-                        "accession_number": "0000320193-24-000123",
-                        "fact_name": "us-gaap:NetIncomeLoss",
-                        "fact_value": 93736000000,
-                        "unit": "USD",
-                        "period_start": "2023-10-01",
-                        "period_end": "2024-09-28",
-                        "segment": None,
-                    },
-                ])
+                mock_context["ti"].xcom_push(
+                    key="facts",
+                    value=[
+                        {
+                            "accession_number": "0000320193-24-000123",
+                            "fact_name": "us-gaap:Revenues",
+                            "fact_value": 391035000000,
+                            "unit": "USD",
+                            "period_start": "2023-10-01",
+                            "period_end": "2024-09-28",
+                            "segment": None,
+                        },
+                        {
+                            "accession_number": "0000320193-24-000123",
+                            "fact_name": "us-gaap:NetIncomeLoss",
+                            "fact_value": 93736000000,
+                            "unit": "USD",
+                            "period_start": "2023-10-01",
+                            "period_end": "2024-09-28",
+                            "segment": None,
+                        },
+                    ],
+                )
                 validate_quality_gates(**mock_context)
             elif task_name == "score_anomalies":
                 score_anomalies(**mock_context)
@@ -190,9 +202,9 @@ class MockDAGRun:
     """Mock Airflow DAGRun for local benchmarking."""
 
     def __init__(self) -> None:
-        self.tasks = []
+        self.tasks: list[Any] = []
 
-    def get_task_instances(self) -> list:
+    def get_task_instances(self) -> list[Any]:
         return self.tasks
 
 
@@ -203,6 +215,6 @@ if __name__ == "__main__":
     )
     try:
         benchmark()
-    except Exception as e:
+    except Exception:
         logger.exception("Benchmark failed")
         sys.exit(1)

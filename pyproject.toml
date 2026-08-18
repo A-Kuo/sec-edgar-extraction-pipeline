@@ -107,10 +107,17 @@ ignore_missing_imports = true
 exclude = ["^migrations/", "^\\.venv/"]
 
 # Airflow's own type surface is not clean enough to gate on; the DAG module is
-# checked for syntax and imports by the dedicated CI job instead.
+# checked for syntax and imports by the dedicated CI job instead
+# (`make dag-check` / tests/test_dag_import.py, against the real installed
+# Airflow). `no-redef` is disabled because the module deliberately redefines
+# Airflow symbols in `except ImportError` fallbacks to span Airflow 2 and 3 —
+# mypy sees both arms of the shim and flags the second as a redefinition.
+# This override applies transitively: scripts/benchmark_pipeline.py imports the
+# task callables from dags/, which pulls the module into the gated scope.
 [[tool.mypy.overrides]]
 module = ["dags.*"]
 disallow_untyped_defs = false
+disable_error_code = ["no-redef"]
 
 [[tool.mypy.overrides]]
 module = ["tests.*"]

@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
 from src.metrics import (
     _append_to_metrics_file,
@@ -25,18 +26,29 @@ from src.schema import Base, ExtractionAudit, ModelRun, PipelineAudit
 
 
 @pytest.fixture
-def in_memory_db() -> str:
-    """Create an in-memory SQLite database for testing."""
-    engine = create_engine("sqlite:///:memory:")
+def in_memory_engine():
+    """
+    Create a single in-memory SQLite engine shared across all connections.
+
+    A plain "sqlite:///:memory:" URL gives each new connection its own
+    private database — StaticPool forces every checkout to reuse the same
+    underlying connection, so tables created via Base.metadata.create_all
+    are visible to sessions opened later against the same engine.
+    """
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     Base.metadata.create_all(engine)
-    return "sqlite:///:memory:"
+    yield engine
+    engine.dispose()
 
 
 @pytest.fixture
-def session_factory(in_memory_db: str):
-    """Factory for creating SQLAlchemy sessions."""
-    engine = create_engine(in_memory_db)
-    return lambda: Session(engine)
+def session_factory(in_memory_engine):
+    """Factory for creating SQLAlchemy sessions against the shared engine."""
+    return lambda: Session(in_memory_engine)
 
 
 def test_count_filings_by_stage(session_factory):
@@ -44,9 +56,15 @@ def test_count_filings_by_stage(session_factory):
     session = session_factory()
     run_id = "test_run_1"
 
-    session.add(PipelineAudit(run_id=run_id, stage="ingest", status="completed", records_processed=5))
-    session.add(PipelineAudit(run_id=run_id, stage="parse", status="completed", records_processed=5))
-    session.add(PipelineAudit(run_id=run_id, stage="validate", status="completed", records_processed=4))
+    session.add(
+        PipelineAudit(run_id=run_id, stage="ingest", status="completed", records_processed=5)
+    )
+    session.add(
+        PipelineAudit(run_id=run_id, stage="parse", status="completed", records_processed=5)
+    )
+    session.add(
+        PipelineAudit(run_id=run_id, stage="validate", status="completed", records_processed=4)
+    )
     session.add(PipelineAudit(run_id=run_id, stage="load", status="completed", records_processed=4))
     session.commit()
 
@@ -64,31 +82,37 @@ def test_compute_success_rates(session_factory):
     session = session_factory()
     run_id = "test_run_2"
 
-    session.add(ExtractionAudit(
-        run_id=run_id,
-        system_id="sys1",
-        accession_number="acc1",
-        stage="parse",
-        extraction_status="success",
-        row_hash="hash1",
-    ))
-    session.add(ExtractionAudit(
-        run_id=run_id,
-        system_id="sys2",
-        accession_number="acc2",
-        stage="parse",
-        extraction_status="success",
-        row_hash="hash2",
-    ))
-    session.add(ExtractionAudit(
-        run_id=run_id,
-        system_id="sys3",
-        accession_number="acc3",
-        stage="parse",
-        extraction_status="failure",
-        detail="Error parsing",
-        row_hash="hash3",
-    ))
+    session.add(
+        ExtractionAudit(
+            run_id=run_id,
+            system_id="sys1",
+            accession_number="acc1",
+            stage="parse",
+            extraction_status="success",
+            row_hash="hash1",
+        )
+    )
+    session.add(
+        ExtractionAudit(
+            run_id=run_id,
+            system_id="sys2",
+            accession_number="acc2",
+            stage="parse",
+            extraction_status="success",
+            row_hash="hash2",
+        )
+    )
+    session.add(
+        ExtractionAudit(
+            run_id=run_id,
+            system_id="sys3",
+            accession_number="acc3",
+            stage="parse",
+            extraction_status="failure",
+            detail="Error parsing",
+            row_hash="hash3",
+        )
+    )
     session.commit()
 
     result = _compute_success_rates(session, run_id)
@@ -104,14 +128,16 @@ def test_compute_success_rates_all_success(session_factory):
     run_id = "test_run_3"
 
     for i in range(3):
-        session.add(ExtractionAudit(
-            run_id=run_id,
-            system_id=f"sys{i}",
-            accession_number=f"acc{i}",
-            stage="parse",
-            extraction_status="success",
-            row_hash=f"hash{i}",
-        ))
+        session.add(
+            ExtractionAudit(
+                run_id=run_id,
+                system_id=f"sys{i}",
+                accession_number=f"acc{i}",
+                stage="parse",
+                extraction_status="success",
+                row_hash=f"hash{i}",
+            )
+        )
     session.commit()
 
     result = _compute_success_rates(session, run_id)
@@ -125,14 +151,16 @@ def test_get_anomaly_counts(session_factory):
     session = session_factory()
     run_id = "test_run_4"
 
-    session.add(ModelRun(
-        run_id=run_id,
-        model_version="v1.0.0",
-        model_sha256="abc123",
-        filings_scored=10,
-        anomalies_flagged=3,
-        threshold=0.75,
-    ))
+    session.add(
+        ModelRun(
+            run_id=run_id,
+            model_version="v1.0.0",
+            model_sha256="abc123",
+            filings_scored=10,
+            anomalies_flagged=3,
+            threshold=0.75,
+        )
+    )
     session.commit()
 
     result = _get_anomaly_counts(session, run_id)
@@ -157,32 +185,40 @@ def test_compute_stage_durations(session_factory):
 
     now = datetime.utcnow()
 
-    session.add(PipelineAudit(
-        run_id=run_id,
-        stage="ingest",
-        status="started",
-        created_at=now,
-    ))
-    session.add(PipelineAudit(
-        run_id=run_id,
-        stage="ingest",
-        status="completed",
-        records_processed=5,
-        created_at=now + timedelta(seconds=1.5),
-    ))
-    session.add(PipelineAudit(
-        run_id=run_id,
-        stage="parse",
-        status="started",
-        created_at=now + timedelta(seconds=1.5),
-    ))
-    session.add(PipelineAudit(
-        run_id=run_id,
-        stage="parse",
-        status="completed",
-        records_processed=5,
-        created_at=now + timedelta(seconds=3.2),
-    ))
+    session.add(
+        PipelineAudit(
+            run_id=run_id,
+            stage="ingest",
+            status="started",
+            created_at=now,
+        )
+    )
+    session.add(
+        PipelineAudit(
+            run_id=run_id,
+            stage="ingest",
+            status="completed",
+            records_processed=5,
+            created_at=now + timedelta(seconds=1.5),
+        )
+    )
+    session.add(
+        PipelineAudit(
+            run_id=run_id,
+            stage="parse",
+            status="started",
+            created_at=now + timedelta(seconds=1.5),
+        )
+    )
+    session.add(
+        PipelineAudit(
+            run_id=run_id,
+            stage="parse",
+            status="completed",
+            records_processed=5,
+            created_at=now + timedelta(seconds=3.2),
+        )
+    )
     session.commit()
 
     result = _compute_stage_durations(session, run_id)
@@ -256,11 +292,18 @@ def test_append_to_metrics_file_multiple_runs():
 
 
 def test_collect_run_metrics_integration(session_factory):
-    """Integration test for full metrics collection."""
+    """
+    Integration test for full metrics collection.
+
+    Uses a file-based SQLite DB rather than ":memory:" — collect_run_metrics
+    opens its own engine from the database_url string, and a ":memory:" URL
+    gives every create_engine() call its own private, empty database, so the
+    rows written below would never be visible to it.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         metrics_file = Path(tmpdir) / "metrics.json"
         run_id = "test_run_integration"
-        db_url = "sqlite:///:memory:"
+        db_url = f"sqlite:///{tmpdir}/test.db"
 
         engine = create_engine(db_url)
         Base.metadata.create_all(engine)
@@ -268,45 +311,55 @@ def test_collect_run_metrics_integration(session_factory):
 
         now = datetime.utcnow()
 
-        session.add(PipelineAudit(
-            run_id=run_id,
-            stage="ingest",
-            status="started",
-            created_at=now,
-        ))
-        session.add(PipelineAudit(
-            run_id=run_id,
-            stage="ingest",
-            status="completed",
-            records_processed=2,
-            created_at=now + timedelta(seconds=0.1),
-        ))
+        session.add(
+            PipelineAudit(
+                run_id=run_id,
+                stage="ingest",
+                status="started",
+                created_at=now,
+            )
+        )
+        session.add(
+            PipelineAudit(
+                run_id=run_id,
+                stage="ingest",
+                status="completed",
+                records_processed=2,
+                created_at=now + timedelta(seconds=0.1),
+            )
+        )
 
-        session.add(ExtractionAudit(
-            run_id=run_id,
-            system_id="sys1",
-            accession_number="acc1",
-            stage="parse",
-            extraction_status="success",
-            row_hash="h1",
-        ))
-        session.add(ExtractionAudit(
-            run_id=run_id,
-            system_id="sys2",
-            accession_number="acc2",
-            stage="parse",
-            extraction_status="success",
-            row_hash="h2",
-        ))
+        session.add(
+            ExtractionAudit(
+                run_id=run_id,
+                system_id="sys1",
+                accession_number="acc1",
+                stage="parse",
+                extraction_status="success",
+                row_hash="h1",
+            )
+        )
+        session.add(
+            ExtractionAudit(
+                run_id=run_id,
+                system_id="sys2",
+                accession_number="acc2",
+                stage="parse",
+                extraction_status="success",
+                row_hash="h2",
+            )
+        )
 
-        session.add(ModelRun(
-            run_id=run_id,
-            model_version="v1.0.0",
-            model_sha256="xyz",
-            filings_scored=2,
-            anomalies_flagged=1,
-            threshold=0.75,
-        ))
+        session.add(
+            ModelRun(
+                run_id=run_id,
+                model_version="v1.0.0",
+                model_sha256="xyz",
+                filings_scored=2,
+                anomalies_flagged=1,
+                threshold=0.75,
+            )
+        )
 
         session.commit()
 

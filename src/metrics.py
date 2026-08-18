@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from src.schema import ExtractionAudit, ModelRun, PipelineAudit
@@ -109,9 +109,12 @@ def _compute_success_rates(session: Session, run_id: str) -> dict[str, float | i
 
 def _get_anomaly_counts(session: Session, run_id: str) -> dict[str, int | float]:
     """Get anomaly detection counts from ModelRun."""
-    stmt = select(ModelRun.filings_scored, ModelRun.anomalies_flagged).where(
-        ModelRun.run_id == run_id
-    ).order_by(ModelRun.created_at.desc()).limit(1)
+    stmt = (
+        select(ModelRun.filings_scored, ModelRun.anomalies_flagged)
+        .where(ModelRun.run_id == run_id)
+        .order_by(ModelRun.created_at.desc())
+        .limit(1)
+    )
     row = session.execute(stmt).fetchone()
 
     if row:
@@ -129,9 +132,11 @@ def _get_anomaly_counts(session: Session, run_id: str) -> dict[str, int | float]
 
 def _compute_stage_durations(session: Session, run_id: str) -> dict[str, float]:
     """Compute per-stage execution times from PipelineAudit created_at timestamps."""
-    stmt = select(PipelineAudit.stage, PipelineAudit.status, PipelineAudit.created_at).where(
-        PipelineAudit.run_id == run_id
-    ).order_by(PipelineAudit.created_at)
+    stmt = (
+        select(PipelineAudit.stage, PipelineAudit.status, PipelineAudit.created_at)
+        .where(PipelineAudit.run_id == run_id)
+        .order_by(PipelineAudit.created_at)
+    )
 
     rows = session.execute(stmt).fetchall()
 

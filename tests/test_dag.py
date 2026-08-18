@@ -18,7 +18,7 @@ in a subprocess against whatever Airflow is actually installed. Treat the two
 files as a pair: this one for structure, that one for "does it actually run".
 
 Covers:
-  - DAG has the correct 8 task IDs (including score_anomalies)
+  - DAG has the correct 9 task IDs (including score_anomalies, collect_run_metrics)
   - Linear dependency chain (1 → 2 → … → 7)
   - All pipeline tasks are upstream of send_alerts_on_failure
   - send_alerts_on_failure uses TriggerRule.ONE_FAILED
@@ -184,6 +184,7 @@ EXPECTED_TASK_IDS = {
     "load_to_warehouse",
     "update_audit_trail",
     "send_alerts_on_failure",
+    "collect_run_metrics",
 }
 
 LINEAR_CHAIN = [
@@ -217,8 +218,8 @@ class TestDAGStructure:
         assert dag.dag_id == "edgar_pipeline"
 
     def test_task_count(self, dag):
-        assert len(dag.task_ids) == 8, (
-            f"Expected 8 tasks, got {len(dag.task_ids)}: {sorted(dag.task_ids)}"
+        assert len(dag.task_ids) == 9, (
+            f"Expected 9 tasks, got {len(dag.task_ids)}: {sorted(dag.task_ids)}"
         )
 
     def test_all_expected_task_ids_present(self, dag):
@@ -355,6 +356,10 @@ class TestTaskCallablesInMockMode:
     def test_send_alerts_does_not_raise_in_mock_mode(self):
         ctx = _make_context()
         dag_module.send_alerts_on_failure(**ctx)
+
+    def test_collect_run_metrics_does_not_raise_in_mock_mode(self):
+        ctx = _make_context()
+        dag_module.collect_run_metrics(**ctx)
 
 
 # ---------------------------------------------------------------------------
