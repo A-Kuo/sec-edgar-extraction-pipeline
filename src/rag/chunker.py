@@ -1,5 +1,12 @@
 """
-Filing text chunking for the retrieval layer.
+Filing text chunking for the lookup aid.
+
+Part of a read-only filing-text search tool (``/ask/{ticker}``) that
+helps users find and quote relevant passages. This is NOT an extraction
+component: it does not produce structured facts, does not write to
+``financial_facts``, and is not the narrative extraction system owned by
+the Fine-Tuned-SEC-Filing-Extraction-Pipeline repo. See
+``docs/BOUNDARY.md`` for the scope contract.
 
 Splits a raw filing HTML/text document into overlapping, metadata-tagged
 chunks suitable for indexing. Every chunk carries enough provenance

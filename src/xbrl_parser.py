@@ -1,6 +1,12 @@
 """
 iXBRL (Inline XBRL) parser for SEC 10-K / 10-Q filings.
 
+Deterministic extraction of machine-tagged financial facts — no model
+inference, no prose parsing. This is the core extraction component of
+the tagged-XBRL pipeline. Numbers embedded in narrative prose (MD&A,
+footnotes, non-GAAP tables) are out of scope and belong to the
+Fine-Tuned-SEC-Filing-Extraction-Pipeline repo. See docs/BOUNDARY.md.
+
 Extracts the 7 target financial facts and returns rows that match the
 ``financial_facts`` table schema (see src/schema.py).
 

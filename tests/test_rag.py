@@ -1,5 +1,10 @@
 """
-Tests for the retrieval + citation-grounded QA layer (src/rag/).
+Tests for the filing-text lookup aid (src/rag/).
+
+This tests the read-only lookup tool, not a fact extraction system.
+The lookup aid retrieves and quotes existing filing prose for human
+review — it does not extract structured facts or write to
+financial_facts. See docs/BOUNDARY.md for the scope contract.
 
 Uses two narrative filing fixtures (a 10-K and a 10-Q for the same
 issuer, distinct accessions and content) to exercise cross-document

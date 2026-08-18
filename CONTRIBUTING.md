@@ -36,11 +36,18 @@ alembic upgrade head
 
 ## Guidelines
 
+- **Tagged-XBRL extraction only.** This repo extracts facts from iXBRL
+  machine tags — not from unstructured narrative. Read
+  [docs/BOUNDARY.md](docs/BOUNDARY.md) before adding features that could
+  overlap with the Fine-Tuned-SEC-Filing-Extraction-Pipeline repo.
 - **Keep extraction deterministic.** No LLM calls belong in the ingest →
   parse → validate → load path (`dags/edgar_pipeline.py`, `src/xbrl_parser.py`,
-  `src/quality.py`). The retrieval layer (`src/rag/`) is the one place an LLM
-  may optionally participate, and only to phrase an answer already
-  constrained to retrieved text — see [Key Design Decisions](README.md#key-design-decisions).
+  `src/quality.py`). The filing-text lookup aid (`src/rag/`) is the one place
+  an LLM may optionally participate, and only to phrase a quoted answer —
+  never to extract or originate facts.
+- **No ML dependencies in the extraction path.** `requirements.txt` must
+  not pull in `torch`, `transformers`, `sentence-transformers`, or similar.
+  `scikit-learn` is present only for TF-IDF in the lookup aid.
 - **New behavior needs a test.** `tests/` mirrors the module layout
   (`test_client.py`, `test_parser.py`, `test_quality.py`, `test_dag.py`,
   `test_api.py`, `test_rag.py`, `test_load_idempotency.py`). Add to the
