@@ -280,13 +280,35 @@ Filing and fact reads check Redis before PostgreSQL. `/anomalies` and `/model/cu
 When handing this project to another contributor or agent, update this section:
 
 **Last updated:** August 2026
-**Current state:** Core pipeline, ML anomaly-detection layer, model registry, idempotent DB writes (`src/upsert.py`), jittered retry backoff, the hash-chained per-accession audit trail (`src/audit.py`, `extraction_audit`), and CI/CD (lint/typecheck/test/DAG-import/migrations/Postgres-trigger verification, model train+gate, Docker build+push) are all implemented and passing. 501 tests.
+**Current state:** This repo is being wound down. Its `main` branch (core
+pipeline, RAG retrieval, analytics marts) was merged into
+[`A-Kuo/Fine-Tuned-SEC-Filing-Extraction-Pipeline`](https://github.com/A-Kuo/Fine-Tuned-SEC-Filing-Extraction-Pipeline)
+as that repo's `warehouse/` subsystem — see [`MIGRATION.md`](MIGRATION.md)
+for the full path/env-var/port mapping and known differences. This branch
+(`claude/sec-edgar-extraction-pipeline-ilcxmv`) is a separate, still-open line
+of work — [PR #1](https://github.com/A-Kuo/sec-edgar-extraction-pipeline/pull/1) —
+that forked from `main` before that merge and added the ML anomaly-detection
+layer, model registry, idempotent DB writes (`src/upsert.py`), jittered retry
+backoff, the hash-chained per-accession audit trail (`src/audit.py`,
+`extraction_audit`), metrics/benchmarking, and CI/CD. All of it is implemented
+and passing (501 tests) but **none of it has moved to the destination repo** —
+PR #1 is unmerged and currently conflicts with `main` (see `MIGRATION.md`'s
+"Work that has not moved" section). Do not treat this repo as a place for new
+feature work; the items below are tracked here only until they're moved.
 
-**Next steps (not yet done):**
+**Next steps — now tracked in the destination repo, not here:**
+- Resolve [PR #1](https://github.com/A-Kuo/sec-edgar-extraction-pipeline/pull/1)
+  (this branch) into `main`, then decide whether/how to port its audit-trail,
+  ML anomaly-detection, and metrics work into the destination repo's
+  `warehouse/` subsystem — this is the one item that has to happen *before*
+  this repo can be archived, since it's the only place that work exists
 - Production deployment guide beyond the container image (no Kubernetes/Helm config exists yet)
 - HashiCorp Vault / cloud secrets manager integration (currently plain environment variables) — also the real `system_id` source `src/audit.py::current_system_id()` should eventually read from instead of the `SYSTEM_ID` environment variable it falls back to today
 - A labelled (not just synthetic-corruption) evaluation set for the anomaly detector, once enough real flagged filings have been reviewed to build one
 - Whether `pipeline_audit` and `extraction_audit` should eventually merge into one table (see `docs/AUDIT_TRAIL_PLAN.md` §11) — left as two tables at different granularities for now, revisit only if it becomes a real pain point
+
+If you have write access to `A-Kuo/Fine-Tuned-SEC-Filing-Extraction-Pipeline`,
+consider opening these as issues there instead of leaving them as prose here.
 
 ## Related Documents
 

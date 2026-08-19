@@ -1,5 +1,21 @@
 # SEC EDGAR Extraction Pipeline
 
+> **This project is being wound down.** Its `main` branch has been merged into
+> [Fine-Tuned-SEC-Filing-Extraction-Pipeline](https://github.com/A-Kuo/Fine-Tuned-SEC-Filing-Extraction-Pipeline)
+> as that repo's `warehouse/` + `dags/` + `migrations/` subsystem. See
+> [docs/WAREHOUSE_INTEGRATION.md](https://github.com/A-Kuo/Fine-Tuned-SEC-Filing-Extraction-Pipeline/blob/claude/sec-edgar-pipeline-eval-sjt0v4/docs/WAREHOUSE_INTEGRATION.md)
+> in that repo for the merged architecture, or [`MIGRATION.md`](MIGRATION.md)
+> in this repo for exactly what moved where.
+>
+> **This repo is not archived yet.** [PR #1](https://github.com/A-Kuo/sec-edgar-extraction-pipeline/pull/1)
+> carries additional work — a hash-chained audit trail, ML anomaly detection,
+> and run metrics/benchmarking — that was developed on a branch that forked
+> before the merge above and was never folded into `main`, so it did not
+> travel with the rest of the code. That PR needs review and a conflict
+> resolution (it deletes work `main` gained independently) before this repo
+> is fully wound down and archived. For all *new* work, go to
+> [Fine-Tuned-SEC-Filing-Extraction-Pipeline](https://github.com/A-Kuo/Fine-Tuned-SEC-Filing-Extraction-Pipeline).
+
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://img.shields.io/badge/CI-GitHub_Actions-2088FF.svg)](.github/workflows/ci.yml)
