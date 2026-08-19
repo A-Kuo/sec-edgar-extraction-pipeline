@@ -1,0 +1,196 @@
+name: CD
+
+# Builds and publishes the container image. Runs on a version tag, or on a
+# manual dispatch for a dry-run build.
+#
+# Tagging a release is the only path to a published image — there is no
+# build-on-merge-to-main. The image that ships is therefore always one somebody
+# deliberately cut, and the tag is a name a rollback can refer to.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: "Push the image to GHCR (unchecked = build only)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false # never abandon a half-finished publish
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+
+jobs:
+  # --------------------------------------------------------------------------
+  # A tag can point at any commit, including one that never passed CI. Re-run
+  # the gates here so a release cannot ship code that was never verified.
+  verify:
+    name: Verify before release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MOCK_EDGAR: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Tests
+        run: pytest tests/ -q
+
+      - name: DAG imports against real Airflow
+        run: pytest tests/test_dag_import.py -q
+
+  # --------------------------------------------------------------------------
+  build-and-push:
+    name: Build and publish image
+    runs-on: ubuntu-latest
+    needs: [verify]
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tags: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' || inputs.push_image
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.title=SEC EDGAR Extraction Pipeline
+            org.opencontainers.image.description=SEC filing ingestion, XBRL extraction, anomaly detection, and serving
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name == 'push' || inputs.push_image }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GitHub Actions cache keeps rebuilds cheap without a persistent runner.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+
+      - name: Smoke-test the built image
+        # Prove the image runs before anyone deploys it. A tagged image that
+        # cannot import its own application is worse than a failed build,
+        # because it looks releasable.
+        run: |
+          docker build -t smoke-test:local .
+          docker run --rm smoke-test:local python -c "
+          import api.main, src.ml, src.schema
+          from src.ml.registry import ModelRegistry
+          print('Application imports OK inside the image')
+          "
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: smoke-test:local
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.spdx.json
+          retention-days: 90
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: smoke-test:local
+          format: table
+          severity: HIGH,CRITICAL
+          # Reported, not blocking: base-image CVEs with no available fix would
+          # otherwise block every release regardless of whether this code is
+          # affected. The scan output is attached to the run for triage.
+          exit-code: "0"
+          output: trivy-report.txt
+
+      - name: Publish scan results
+        if: always()
+        run: |
+          {
+            echo "## Image vulnerability scan"
+            echo
+            echo '```'
+            cat trivy-report.txt 2>/dev/null || echo "no report produced"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest build provenance
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Summarise the release
+        if: github.event_name == 'push'
+        run: |
+          {
+            echo "## Released"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Tags | \`${{ steps.meta.outputs.tags }}\` |"
+            echo "| Digest | \`${{ steps.build.outputs.digest }}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo
+            echo "Pull by digest to pin the exact image:"
+            echo
+            echo '```bash'
+            echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

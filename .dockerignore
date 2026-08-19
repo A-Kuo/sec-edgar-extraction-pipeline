@@ -1,0 +1,38 @@
+# Keep the build context small and secrets out of image layers.
+
+.git
+.github
+.gitignore
+
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+.eggs
+
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+coverage.xml
+htmlcov
+
+# Trained models are mounted at runtime, not baked in: an image would otherwise
+# pin one model version forever and a promotion would need a rebuild.
+models/
+
+tests/
+docs/
+*.md
+!README.md
+
+.env
+.env.*
+*.log
+*.db
+*.sqlite3
+
+.idea
+.vscode
+.DS_Store

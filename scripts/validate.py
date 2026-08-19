@@ -19,9 +19,16 @@ Environment variables required
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import sys
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sqlalchemy.engine import Engine
+
+    from src.quality import PSIResult, QualityResult
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,14 +93,14 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _get_engine():
+def _get_engine() -> Engine:
     from sqlalchemy import create_engine
 
     url = os.getenv("DATABASE_URL", "postgresql://sec_user:sec_pass@localhost/sec_edgar")
     return create_engine(url, pool_pre_ping=True)
 
 
-def _list_runs(engine) -> None:
+def _list_runs(engine: Engine) -> None:
     from sqlalchemy import text
 
     with engine.connect() as conn:
@@ -118,7 +125,7 @@ def _list_runs(engine) -> None:
         print(f"{r[0]:<50} {r[1]:<12} {r[2]:<12} {r[3] or 0:>8}  {r[4]}")
 
 
-def _get_facts_by_accession(run_id: str, engine) -> dict[str, list[str]]:
+def _get_facts_by_accession(run_id: str, engine: Engine) -> dict[str, list[str]]:
     """Return {accession_number: [fact_name, ...]} for filings in *run_id*."""
     from sqlalchemy import text
 
@@ -142,7 +149,9 @@ def _get_facts_by_accession(run_id: str, engine) -> dict[str, list[str]]:
     return result
 
 
-def _get_fact_values(fact_name: str, days_back: int, engine) -> tuple[list[float], list[float]]:
+def _get_fact_values(
+    fact_name: str, days_back: int, engine: Engine
+) -> tuple[list[float], list[float]]:
     """
     Return (baseline_values, current_values) for PSI computation.
 
@@ -186,7 +195,7 @@ def _get_fact_values(fact_name: str, days_back: int, engine) -> tuple[list[float
     return [r[0] for r in baseline], [r[0] for r in current]
 
 
-def _print_completeness(result, threshold: float) -> None:
+def _print_completeness(result: QualityResult, threshold: float) -> None:
     ratio = result.completeness_ratio
     pct = f"{ratio:.1%}"
     if ratio >= threshold:
@@ -210,7 +219,7 @@ def _print_completeness(result, threshold: float) -> None:
             print(f"    … and {len(result.missing_facts_by_accession) - 10} more")
 
 
-def _print_psi(results: list) -> None:
+def _print_psi(results: list[PSIResult]) -> None:
     from src.quality import PSILevel
 
     print(f"\n{_c('PSI drift checks', _BOLD)}")
@@ -270,13 +279,11 @@ def main() -> None:
             _print_completeness(result, args.completeness_threshold)
         except ValueError as exc:
             # check_completeness raises on failure — still print the result
-            from src.quality import QualityResult
             # Re-run without raising to get the result object for display
             from src.quality import check_completeness as _cc
-            try:
+
+            with contextlib.suppress(Exception):
                 _cc(args.run_id, facts_by_acc, threshold=0.0)
-            except Exception:
-                pass
             print(_c(f"\n  COMPLETENESS FAILED: {exc}", _RED))
             exit_code = 1
 
@@ -286,12 +293,17 @@ def main() -> None:
         try:
             baseline, current = _get_fact_values(fact_name, args.baseline_days, engine)
             if not baseline or not current:
-                logger.warning("Not enough data for PSI on %s (baseline=%d, current=%d)",
-                               fact_name, len(baseline), len(current))
+                logger.warning(
+                    "Not enough data for PSI on %s (baseline=%d, current=%d)",
+                    fact_name,
+                    len(baseline),
+                    len(current),
+                )
                 continue
             psi_result = check_psi_drift(fact_name, baseline, current)
             psi_results.append(psi_result)
             from src.quality import PSILevel
+
             if psi_result.level == PSILevel.ALERT:
                 exit_code = 1
         except Exception as exc:

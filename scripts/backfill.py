@@ -39,6 +39,15 @@ import json
 import logging
 import os
 import sys
+from datetime import date
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sqlalchemy.engine import Engine
+
+    from src.cache import FilingCache
+    from src.edgar_client import EdgarClient
+    from src.xbrl_parser import XBRLParser
 from datetime import date, datetime
 from pathlib import Path
 
@@ -122,6 +131,7 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _resolve_ciks(tickers: list[str], client: EdgarClient) -> list[str]:
 # ---------------------------------------------------------------------------
 # Checkpoint state — {"<cik>": {"completed": [accession, ...], "last_filing_date": "YYYY-MM-DD"}}
 # ---------------------------------------------------------------------------
@@ -148,7 +158,7 @@ def _save_checkpoint(path: str, checkpoint: dict) -> None:
 
 def _resolve_ciks(tickers: list[str], client) -> list[str]:
     """Resolve ticker symbols to CIK strings via EDGAR."""
-    ciks = []
+    ciks: list[str] = []
     for ticker in tickers:
         try:
             # EDGAR ticker-to-CIK: search the company tickers JSON
@@ -187,6 +197,10 @@ def _ingest_cik(
     end_date: str,
     form_types: list[str],
     dry_run: bool,
+    client: EdgarClient,
+    parser: XBRLParser,
+    engine: Engine,
+    cache: FilingCache | None,
     client,
     parser,
     engine,
@@ -208,6 +222,7 @@ def _ingest_cik(
     Returns (filings_processed, facts_inserted).
     """
     from sqlalchemy.orm import Session
+
     from src.schema import FilingRaw, FinancialFact
 
     cik_state = checkpoint.setdefault(cik, {"completed": [], "last_filing_date": None})
@@ -242,6 +257,7 @@ def _ingest_cik(
             "period_of_report": periods[i] if i < len(periods) else None,
         }
         for i in range(len(accessions))
+        if forms[i] in form_types and start_date <= dates[i] <= end_date
         if forms[i] in form_types
         and effective_start_date <= dates[i] <= end_date
     ]
@@ -253,6 +269,12 @@ def _ingest_cik(
         skipped_done = len(all_candidates) - len(candidates)
 
     logger.info(
+        "CIK %s: %d filings in range [%s, %s] for form(s) %s",
+        cik,
+        len(candidates),
+        start_date,
+        end_date,
+        form_types,
         "CIK %s: %d filings in range [%s, %s] for form(s) %s (%d already completed, skipped)",
         cik, len(candidates), effective_start_date, end_date, form_types, skipped_done,
     )
@@ -275,8 +297,7 @@ def _ingest_cik(
 
             if cached_facts is None:
                 html = client.get_filing_document(
-                    f"https://www.sec.gov/Archives/edgar/data/"
-                    f"{cik}/{acc.replace('-', '')}/"
+                    f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc.replace('-', '')}/"
                 )
                 fact_rows = parser.parse(html, acc)
             else:
@@ -305,7 +326,6 @@ def _ingest_cik(
                         d = row.as_dict()
                         # Convert Decimal to float for SQLAlchemy
                         if d.get("fact_value") is not None:
-                            from decimal import Decimal as _D
                             d["fact_value"] = float(d["fact_value"])
                         session.add(FinancialFact(**d))
                     facts_total += len(fact_rows)
@@ -343,9 +363,10 @@ def main() -> None:
     redis_url = os.getenv("REDIS_URL")
 
     from sqlalchemy import create_engine
+
+    from src.cache import FilingCache
     from src.edgar_client import EdgarClient
     from src.xbrl_parser import XBRLParser
-    from src.cache import FilingCache
 
     engine = create_engine(database_url, pool_pre_ping=True)
     client = EdgarClient()

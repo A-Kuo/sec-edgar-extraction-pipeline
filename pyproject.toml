@@ -1,0 +1,125 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sec-edgar-extraction-pipeline"
+version = "1.1.0"
+description = "SEC EDGAR 10-K/10-Q ingestion, XBRL fact extraction, anomaly detection, and cached serving."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[tool.setuptools]
+packages = ["src", "src.ml", "api", "dags", "scripts"]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "-ra",
+]
+markers = [
+    "integration: requires live PostgreSQL and Redis (deselect with '-m \"not integration\"')",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:airflow.*",
+]
+
+# ---------------------------------------------------------------------------
+# coverage
+# ---------------------------------------------------------------------------
+
+[tool.coverage.run]
+source = ["src", "api", "dags", "scripts"]
+branch = true
+omit = ["*/__init__.py", "migrations/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["migrations/versions", ".venv"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",    # line length is enforced by the formatter, not the linter
+    "B008",    # FastAPI's Depends() in defaults is idiomatic
+    "RUF012",  # mutable class attrs without ClassVar (noisy on SQLAlchemy models)
+    "RUF001",  # ambiguous-unicode: deliberate typography (×, –) in prose/docstrings
+    "RUF002",
+    "RUF003",
+    "UP042",   # str+Enum: PSILevel/PSIResult (pre-existing) serialise via .value;
+               # StrEnum changes str(member) formatting and isn't worth the churn
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+"dags/edgar_pipeline.py" = ["E402"]  # compat imports must follow the env-flag block
+
+[tool.ruff.lint.isort]
+known-first-party = ["src", "api", "dags", "scripts"]
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+check_untyped_defs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+ignore_missing_imports = true
+exclude = ["^migrations/", "^\\.venv/"]
+
+# Airflow's own type surface is not clean enough to gate on; the DAG module is
+# checked for syntax and imports by the dedicated CI job instead
+# (`make dag-check` / tests/test_dag_import.py, against the real installed
+# Airflow). `no-redef` is disabled because the module deliberately redefines
+# Airflow symbols in `except ImportError` fallbacks to span Airflow 2 and 3 —
+# mypy sees both arms of the shim and flags the second as a redefinition.
+# This override applies transitively: scripts/benchmark_pipeline.py imports the
+# task callables from dags/, which pulls the module into the gated scope.
+[[tool.mypy.overrides]]
+module = ["dags.*"]
+disallow_untyped_defs = false
+disable_error_code = ["no-redef"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+check_untyped_defs = false

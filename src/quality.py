@@ -21,9 +21,9 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -95,10 +95,7 @@ class PSIResult:
     current_count: int
 
     def __str__(self) -> str:
-        return (
-            f"PSIResult(fact={self.fact_name}, psi={self.psi:.4f}, "
-            f"level={self.level.value})"
-        )
+        return f"PSIResult(fact={self.fact_name}, psi={self.psi:.4f}, level={self.level.value})"
 
 
 # ---------------------------------------------------------------------------
@@ -174,10 +171,53 @@ def check_completeness(
 # ---------------------------------------------------------------------------
 
 
+def _uniform_edges(base: list[float], curr: list[float], bins: int) -> list[float] | None:
+    """Equal-width bin edges spanning the combined range of both samples."""
+    all_vals = base + curr
+    min_val, max_val = min(all_vals), max(all_vals)
+    if min_val == max_val:
+        return None
+
+    step = (max_val - min_val) / bins
+    edges = [min_val + i * step for i in range(bins + 1)]
+    edges[-1] = max_val + 1e-9  # ensure the max value falls inside the last bin
+    return edges
+
+
+def _quantile_edges(base: list[float], bins: int) -> list[float] | None:
+    """
+    Equal-frequency bin edges taken from the baseline's quantiles.
+
+    Every baseline bin holds ~1/bins of the mass by construction, which is what
+    removes the epsilon artifact described in :func:`compute_psi`. Duplicate
+    edges (from heavy ties, e.g. a feature that is 0.0 for most filings) are
+    collapsed, so the effective bin count can be lower than requested — that is
+    correct behaviour, not a defect: a distribution with three distinct values
+    cannot support ten bins.
+    """
+    ordered = sorted(base)
+    n = len(ordered)
+
+    raw = [ordered[min(round(q * n / bins), n - 1)] for q in range(bins + 1)]
+    raw[0] = ordered[0]
+    raw[-1] = ordered[-1]
+
+    edges = sorted(set(raw))
+    if len(edges) < 2:
+        return None
+
+    # Open the outer edges so values beyond the baseline's observed range still
+    # land in the first or last bin rather than being dropped.
+    edges[0] = -math.inf
+    edges[-1] = math.inf
+    return edges
+
+
 def compute_psi(
     baseline_values: Sequence[float],
     current_values: Sequence[float],
     bins: int = 10,
+    strategy: str = "uniform",
 ) -> float:
     """
     Compute the Population Stability Index between two numeric distributions.
@@ -190,57 +230,71 @@ def compute_psi(
 
     A small epsilon replaces zero proportions to avoid log(0).
 
+    Binning strategy
+    ----------------
+    ``"uniform"`` (default) uses equal-width bins across the combined range.
+    ``"quantile"`` uses equal-frequency bins taken from the baseline.
+
+    The distinction matters more than it looks. On skewed data — which every
+    financial magnitude is — equal-width bins concentrate almost all mass in
+    one or two bins and leave the rest nearly empty. The epsilon floor then
+    dominates those empty bins and manufactures PSI out of nothing: two samples
+    drawn from the *same* distribution measured PSI 0.37 (ALERT) on
+    ``log_assets`` whose means differed by 0.2%. Quantile binning gives every
+    baseline bin ~1/bins of the mass, so there are no near-empty bins for the
+    epsilon to inflate.
+
+    ``"uniform"`` remains the default so existing callers keep their calibrated
+    behaviour; new drift checks on skewed features should pass
+    ``strategy="quantile"``.
+
     Args:
         baseline_values:  Reference (historical) numeric values.
         current_values:   Current period numeric values.
-        bins:             Number of equal-width bins (default 10).
+        bins:             Number of bins (default 10).
+        strategy:         ``"uniform"`` or ``"quantile"``.
 
     Returns:
         PSI as a float (≥ 0).  Returns 0.0 for trivially identical inputs.
 
     Raises:
-        ``ValueError`` if either sequence is empty.
+        ``ValueError`` if either sequence is empty or *strategy* is unknown.
     """
     if not baseline_values:
         raise ValueError("baseline_values must not be empty")
     if not current_values:
         raise ValueError("current_values must not be empty")
+    if strategy not in ("uniform", "quantile"):
+        raise ValueError(f"strategy must be 'uniform' or 'quantile', got {strategy!r}")
 
     base = list(baseline_values)
     curr = list(current_values)
 
-    # Determine bin edges from the combined range
-    all_vals = base + curr
-    min_val = min(all_vals)
-    max_val = max(all_vals)
-
-    if min_val == max_val:
-        # All values identical → no drift
+    edges = (
+        _uniform_edges(base, curr, bins) if strategy == "uniform" else _quantile_edges(base, bins)
+    )
+    if edges is None:
+        # Degenerate: every value identical, or too few distinct values to bin.
         return 0.0
 
-    step = (max_val - min_val) / bins
-    edges = [min_val + i * step for i in range(bins + 1)]
-    edges[-1] = max_val + 1e-9  # ensure the max value is included
+    n_bins = len(edges) - 1
 
     def proportions(values: list[float]) -> list[float]:
-        counts = [0] * bins
-        n = len(values)
+        counts = [0] * n_bins
         for v in values:
-            idx = 0
-            for b in range(bins):
+            for b in range(n_bins):
                 if v < edges[b + 1]:
-                    idx = b
+                    counts[b] += 1
                     break
             else:
-                idx = bins - 1
-            counts[idx] += 1
-        return [c / n for c in counts]
+                counts[n_bins - 1] += 1
+        return [c / len(values) for c in counts]
 
     base_props = proportions(base)
     curr_props = proportions(curr)
 
     psi = 0.0
-    for e_i, a_i in zip(base_props, curr_props):
+    for e_i, a_i in zip(base_props, curr_props, strict=True):
         # Replace zeros with epsilon
         e = e_i if e_i > 0 else _EPSILON
         a = a_i if a_i > 0 else _EPSILON
@@ -263,13 +317,19 @@ def check_psi_drift(
     baseline_values: Sequence[float],
     current_values: Sequence[float],
     bins: int = 10,
+    strategy: str = "uniform",
 ) -> PSIResult:
     """
     Compute PSI for one fact and return a labelled result.
 
     Logs a warning at WARN level and an error at ALERT level.
+
+    Note: fact values are heavily skewed, so ``strategy="quantile"`` will give
+    far fewer false alarms here than the ``"uniform"`` default — see
+    :func:`compute_psi`. The default is retained for backward compatibility
+    with existing calibrated thresholds.
     """
-    psi = compute_psi(baseline_values, current_values, bins)
+    psi = compute_psi(baseline_values, current_values, bins, strategy)
     level = classify_psi(psi)
 
     result = PSIResult(

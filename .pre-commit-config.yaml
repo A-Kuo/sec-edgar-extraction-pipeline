@@ -1,0 +1,52 @@
+# Catches locally what CI would otherwise catch minutes later.
+#   pre-commit install
+#   pre-commit run --all-files
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        # Model artifacts belong in the registry, not in git history, where they
+        # would be permanent and unprunable.
+        args: [--maxkb=500]
+      - id: detect-private-key
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.14.0
+    hooks:
+      - id: mypy
+        files: ^(src|api|scripts)/
+        additional_dependencies:
+          - types-requests
+          - types-redis
+        args: [--ignore-missing-imports]
+
+  - repo: local
+    hooks:
+      # The one check that needs the real environment. Kept as a local hook
+      # because it must run against the Airflow actually installed here — an
+      # isolated hook environment would reintroduce exactly the mocked-away
+      # blind spot this test exists to close.
+      - id: dag-import
+        name: DAG imports against installed Airflow
+        entry: pytest tests/test_dag_import.py -q
+        language: system
+        pass_filenames: false
+        files: ^dags/

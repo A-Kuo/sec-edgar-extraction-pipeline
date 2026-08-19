@@ -1,19 +1,29 @@
 """
-Tests for dags/edgar_pipeline.py
+Tests for dags/edgar_pipeline.py — structure and task-callable behaviour.
 
-Because apache-airflow requires Python ≤ 3.12 and this environment uses
-Python 3.14, all Airflow classes are replaced with lightweight mocks injected
-into sys.modules BEFORE the dag module is imported.  The mocks faithfully
-replicate the ``>>`` operator chaining and trigger_rule plumbing so every
-structural assertion is meaningful.
+Airflow classes are replaced with lightweight mocks injected into
+sys.modules BEFORE the dag module is imported, so these tests run in
+milliseconds with no metastore and no dependency on which Airflow version
+happens to be installed. The mocks faithfully replicate the ``>>`` operator
+chaining and trigger_rule plumbing so the structural assertions below are
+meaningful.
+
+What this file deliberately does NOT cover: whether the DAG actually imports
+against a real, installed Airflow. It once did not — an unbounded
+``apache-airflow>=2.8.0`` pin resolved to Airflow 3.x, which removed the
+``schedule_interval`` argument and relocated several modules, and this whole
+suite stayed green because the mocks never exercised the real import path.
+That gap is closed by ``tests/test_dag_import.py``, which imports the module
+in a subprocess against whatever Airflow is actually installed. Treat the two
+files as a pair: this one for structure, that one for "does it actually run".
 
 Covers:
-  - DAG has the correct 7 task IDs
-  - Linear dependency chain (1 → 2 → … → 6)
+  - DAG has the correct 9 task IDs (including score_anomalies, collect_run_metrics)
+  - Linear dependency chain (1 → 2 → … → 7)
   - All pipeline tasks are upstream of send_alerts_on_failure
   - send_alerts_on_failure uses TriggerRule.ONE_FAILED
   - Task callables can be invoked in MOCK_EDGAR mode
-  - AirflowSkipException raised on empty facts (validate stage)
+  - AirflowSkipException raised on empty facts (validate, score stages)
   - Mock fixture data integrity (required keys, required facts)
 """
 
@@ -35,6 +45,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 # ── Exceptions ──────────────────────────────────────────────────────────────
 
+
 class AirflowSkipException(Exception):
     pass
 
@@ -45,6 +56,7 @@ class AirflowFailException(Exception):
 
 # ── TriggerRule ─────────────────────────────────────────────────────────────
 
+
 class TriggerRule:
     ONE_FAILED = "one_failed"
     ALL_SUCCESS = "all_success"
@@ -53,10 +65,11 @@ class TriggerRule:
 
 # ── PythonOperator ───────────────────────────────────────────────────────────
 
+
 class PythonOperator:
     """Minimal PythonOperator stub tracking task graph edges."""
 
-    _active_dag: "DAG | None" = None
+    _active_dag: DAG | None = None
 
     def __init__(
         self,
@@ -104,17 +117,21 @@ class PythonOperator:
 
 # ── DAG ─────────────────────────────────────────────────────────────────────
 
+
 class DAG:
     def __init__(self, dag_id: str, **kwargs) -> None:
         self.dag_id = dag_id
-        self.schedule_interval = kwargs.get("schedule_interval")
+        # Airflow 3 renamed `schedule_interval` to `schedule`; accept either so
+        # this mock tracks dags/edgar_pipeline.py regardless of which the
+        # installed Airflow (or this file) uses.
+        self.schedule_interval = kwargs.get("schedule", kwargs.get("schedule_interval"))
         self.catchup = kwargs.get("catchup", True)
         self.max_active_runs = kwargs.get("max_active_runs", 16)
         self.default_args = kwargs.get("default_args", {})
         self.tags = kwargs.get("tags", [])
         self._tasks: list[PythonOperator] = []
 
-    def __enter__(self) -> "DAG":
+    def __enter__(self) -> DAG:
         PythonOperator._active_dag = self
         return self
 
@@ -130,6 +147,7 @@ class DAG:
 
 
 # ── Inject into sys.modules ──────────────────────────────────────────────────
+
 
 def _make_mod(**attrs):
     m = MagicMock()
@@ -149,9 +167,9 @@ sys.modules["airflow.utils"] = MagicMock()
 sys.modules["airflow.utils.trigger_rule"] = _make_mod(TriggerRule=TriggerRule)
 
 # Now it is safe to import the DAG module.
-import dags.edgar_pipeline as dag_module  # noqa: E402
-
 import pytest  # noqa: E402
+
+import dags.edgar_pipeline as dag_module  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Shared constants
@@ -162,9 +180,11 @@ EXPECTED_TASK_IDS = {
     "download_raw_documents",
     "parse_xbrl_facts",
     "validate_quality_gates",
+    "score_anomalies",
     "load_to_warehouse",
     "update_audit_trail",
     "send_alerts_on_failure",
+    "collect_run_metrics",
 }
 
 LINEAR_CHAIN = [
@@ -172,6 +192,7 @@ LINEAR_CHAIN = [
     "download_raw_documents",
     "parse_xbrl_facts",
     "validate_quality_gates",
+    "score_anomalies",
     "load_to_warehouse",
     "update_audit_trail",
 ]
@@ -197,8 +218,8 @@ class TestDAGStructure:
         assert dag.dag_id == "edgar_pipeline"
 
     def test_task_count(self, dag):
-        assert len(dag.task_ids) == 7, (
-            f"Expected 7 tasks, got {len(dag.task_ids)}: {sorted(dag.task_ids)}"
+        assert len(dag.task_ids) == 9, (
+            f"Expected 9 tasks, got {len(dag.task_ids)}: {sorted(dag.task_ids)}"
         )
 
     def test_all_expected_task_ids_present(self, dag):
@@ -299,6 +320,29 @@ class TestTaskCallablesInMockMode:
         with pytest.raises(AirflowSkipException):
             dag_module.validate_quality_gates(**ctx)
 
+    def test_score_anomalies_skips_without_a_promoted_model(self, tmp_path, monkeypatch):
+        """
+        No model has been registered/promoted in this test environment.
+        score_anomalies must degrade to "no scores" rather than fail the
+        DAG — an outage in the ML stage must never block filings that already
+        passed the deterministic quality gates.
+        """
+        monkeypatch.setenv("MODEL_REGISTRY_ROOT", str(tmp_path / "empty-registry"))
+        ctx = _make_context()
+        ctx["ti"].xcom_pull.return_value = dag_module._MOCK_FACTS
+
+        result = dag_module.score_anomalies(**ctx)  # must not raise
+
+        assert result["scored"] == 0
+        assert result["flagged"] == 0
+        assert "reason" in result
+
+    def test_score_anomalies_raises_skip_on_empty_facts(self):
+        ctx = _make_context()
+        ctx["ti"].xcom_pull.return_value = []
+        with pytest.raises(AirflowSkipException):
+            dag_module.score_anomalies(**ctx)
+
     def test_load_to_warehouse_returns_count(self):
         ctx = _make_context()
         ctx["ti"].xcom_pull.return_value = dag_module._MOCK_FACTS
@@ -313,9 +357,133 @@ class TestTaskCallablesInMockMode:
         ctx = _make_context()
         dag_module.send_alerts_on_failure(**ctx)
 
+    def test_collect_run_metrics_does_not_raise_in_mock_mode(self):
+        ctx = _make_context()
+        dag_module.collect_run_metrics(**ctx)
+
 
 # ---------------------------------------------------------------------------
-# 4. Mock fixture integrity
+# 4. Extraction audit wiring (real SQLite DB, not the mocked-Airflow path)
+#
+# _write_extraction_audit and _load_audit_outcomes are plain functions that
+# open their own SQLAlchemy engine from dag_module.DATABASE_URL — they don't
+# touch Airflow at all, so they're testable directly against a real (file-
+# backed, so it persists across the module's own separate engine/session)
+# SQLite database rather than through the mocked-Airflow context used above.
+# ---------------------------------------------------------------------------
+
+
+class TestExtractionAuditWiring:
+    @pytest.fixture
+    def audit_db(self, tmp_path, monkeypatch):
+        """A real file-backed SQLite DB with the schema created, wired in
+        as dag_module.DATABASE_URL for the duration of the test."""
+        from sqlalchemy import create_engine
+
+        from src.schema import Base
+
+        db_path = tmp_path / "audit_test.db"
+        db_url = f"sqlite:///{db_path}"
+        Base.metadata.create_all(create_engine(db_url))
+        monkeypatch.setattr(dag_module, "DATABASE_URL", db_url)
+        return db_url
+
+    def _read_rows(self, db_url):
+        from sqlalchemy import create_engine, select
+        from sqlalchemy.orm import Session
+
+        from src.schema import ExtractionAudit
+
+        with Session(create_engine(db_url)) as session:
+            return session.scalars(select(ExtractionAudit).order_by(ExtractionAudit.id)).all()
+
+    def test_writes_one_row_per_accession(self, audit_db):
+        dag_module._write_extraction_audit(
+            "run-1",
+            "download",
+            {
+                "A": ("success", None, "c" * 64),
+                "B": ("failure", "timed out", None),
+            },
+        )
+        rows = self._read_rows(audit_db)
+        assert len(rows) == 2
+        by_accession = {r.accession_number: r for r in rows}
+        assert by_accession["A"].extraction_status == "success"
+        assert by_accession["A"].content_hash == "c" * 64
+        assert by_accession["B"].extraction_status == "failure"
+        assert by_accession["B"].detail == "timed out"
+
+    def test_rows_are_hash_chained(self, audit_db):
+        dag_module._write_extraction_audit(
+            "run-1", "download", {"A": ("success", None, None), "B": ("success", None, None)}
+        )
+        rows = self._read_rows(audit_db)
+        assert rows[1].prev_row_hash == rows[0].row_hash
+
+    def test_chain_across_stages_verifies(self, audit_db):
+        """download then parse then load, in separate calls (as the DAG
+        actually makes them) — the chain must span all of them cleanly."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
+
+        from src.audit import verify_chain
+
+        dag_module._write_extraction_audit("run-1", "download", {"A": ("success", None, None)})
+        dag_module._write_extraction_audit("run-1", "parse", {"A": ("success", None, None)})
+        dag_module._write_extraction_audit("run-1", "load", {"A": ("success", None, None)})
+
+        with Session(create_engine(audit_db)) as session:
+            result = verify_chain(session)
+        assert result.valid
+        assert result.total_rows == 3
+
+    def test_empty_outcomes_writes_nothing_and_does_not_raise(self, audit_db):
+        dag_module._write_extraction_audit("run-1", "download", {})
+        assert self._read_rows(audit_db) == []
+
+    def test_a_broken_write_propagates_rather_than_being_swallowed(self, monkeypatch, audit_db):
+        """Unlike score_anomalies, an audit-write failure must fail the
+        calling task — see the rationale in _write_extraction_audit's
+        docstring. Simulated here by pointing at a DB with no schema."""
+        from sqlalchemy.exc import OperationalError
+
+        monkeypatch.setattr(dag_module, "DATABASE_URL", "sqlite:///:memory:")
+        with pytest.raises(OperationalError):  # no such table
+            dag_module._write_extraction_audit("run-1", "download", {"A": ("success", None, None)})
+
+
+class TestLoadAuditOutcomes:
+    def test_maps_each_accession_to_the_given_status(self):
+        facts = [
+            {"accession_number": "A", "fact_name": "us-gaap:Revenues"},
+            {"accession_number": "B", "fact_name": "us-gaap:Assets"},
+        ]
+        outcomes = dag_module._load_audit_outcomes(facts, "success")
+        assert outcomes == {"A": ("success", None, None), "B": ("success", None, None)}
+
+    def test_deduplicates_accessions_from_multiple_fact_rows(self):
+        facts = [
+            {"accession_number": "A", "fact_name": "us-gaap:Revenues"},
+            {"accession_number": "A", "fact_name": "us-gaap:Assets"},
+        ]
+        assert dag_module._load_audit_outcomes(facts, "success") == {"A": ("success", None, None)}
+
+    def test_carries_the_detail_message_on_failure(self):
+        facts = [{"accession_number": "A", "fact_name": "us-gaap:Revenues"}]
+        outcomes = dag_module._load_audit_outcomes(facts, "failure", "db unavailable")
+        assert outcomes == {"A": ("failure", "db unavailable", None)}
+
+    def test_empty_facts_yields_empty_outcomes(self):
+        assert dag_module._load_audit_outcomes([], "success") == {}
+
+    def test_facts_missing_accession_number_are_skipped(self):
+        facts = [{"fact_name": "us-gaap:Revenues"}]
+        assert dag_module._load_audit_outcomes(facts, "success") == {}
+
+
+# ---------------------------------------------------------------------------
+# 5. Mock fixture integrity
 # ---------------------------------------------------------------------------
 
 

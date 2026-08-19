@@ -10,7 +10,7 @@ Covers:
 
 from __future__ import annotations
 
-import math
+import contextlib
 
 import pytest
 
@@ -25,7 +25,6 @@ from src.quality import (
     classify_psi,
     compute_psi,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -75,7 +74,7 @@ class TestComputePSI:
 
     def test_large_shift_above_alert(self):
         """Completely disjoint distributions → PSI well above 0.25."""
-        base = [float(x) for x in range(1, 101)]    # 1..100
+        base = [float(x) for x in range(1, 101)]  # 1..100
         curr = [float(x) for x in range(201, 301)]  # 201..300
         psi = compute_psi(base, curr)
         assert psi > PSI_ALERT_THRESHOLD
@@ -83,6 +82,7 @@ class TestComputePSI:
     def test_psi_is_nonnegative(self):
         """PSI must always be ≥ 0."""
         import random
+
         random.seed(42)
         base = [random.gauss(0, 1) for _ in range(200)]
         curr = [random.gauss(1, 2) for _ in range(150)]
@@ -230,10 +230,8 @@ class TestCheckCompleteness:
             "0000-24-0001": ["us-gaap:Revenues", "us-gaap:NetIncomeLoss", "us-gaap:Assets"],
             "0000-24-0002": ["us-gaap:Revenues"],
         }
-        try:
+        with contextlib.suppress(ValueError):
             check_completeness(self._RUN_ID, facts, threshold=0.5)
-        except ValueError:
-            pass
         # Even passing threshold=0.5 with 1/2 complete should pass
         result = check_completeness(self._RUN_ID, facts, threshold=0.5)
         assert "0000-24-0002" in result.missing_facts_by_accession
@@ -270,7 +268,5 @@ class TestCheckCompleteness:
         facts = {
             "acc1": ["my-gaap:Revenue"],
         }
-        result = check_completeness(
-            self._RUN_ID, facts, required_facts=["my-gaap:Revenue"]
-        )
+        result = check_completeness(self._RUN_ID, facts, required_facts=["my-gaap:Revenue"])
         assert result.complete_filings == 1

@@ -1,0 +1,22 @@
+# Development and CI-only dependencies.
+#   pip install -r requirements.txt -r requirements-dev.txt
+
+-r requirements.txt
+
+# --- Test ---
+pytest>=7.4.0,<10
+pytest-cov>=4.1.0,<8
+requests-mock>=1.11.0,<2
+httpx>=0.27.0,<1        # required by fastapi.testclient.TestClient
+
+# --- Lint / type-check ---
+ruff>=0.6.0,<1
+mypy>=1.11.0,<2
+types-requests>=2.31.0
+types-redis>=4.6.0
+
+# --- Supply chain ---
+pip-audit>=2.7.0,<3
+
+# --- Hooks ---
+pre-commit>=3.7.0,<5

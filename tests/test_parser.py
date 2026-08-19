@@ -18,16 +18,14 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-
-from src.xbrl_parser import (
-    TARGET_FACTS,
-    XBRLParser,
-    apply_amendment_supersession,
-    _parse_fact_value,
-    _parse_date,
-)
 from lxml import etree
 
+from src.xbrl_parser import (
+    XBRLParser,
+    _parse_date,
+    _parse_fact_value,
+    apply_amendment_supersession,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 ACCESSION = "0000320193-24-000123"
@@ -57,6 +55,7 @@ def consolidated_rows(parser, fixture_html):
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def get_fact(rows, name, segment=None):
     return next(
         (r for r in rows if r.fact_name == name and r.segment == segment),
@@ -67,6 +66,7 @@ def get_fact(rows, name, segment=None):
 # ---------------------------------------------------------------------------
 # 1. All target facts are extracted
 # ---------------------------------------------------------------------------
+
 
 class TestFactExtraction:
     def test_revenues_extracted(self, parsed_rows):
@@ -114,6 +114,7 @@ class TestFactExtraction:
 # 2. Scale conversion (millions and thousands)
 # ---------------------------------------------------------------------------
 
+
 class TestScaleConversion:
     def test_revenues_millions_scale(self, parsed_rows):
         """scale="6" on value 391,035 → 391,035,000,000"""
@@ -139,6 +140,7 @@ class TestScaleConversion:
 # ---------------------------------------------------------------------------
 # 3. Period handling: duration vs instant
 # ---------------------------------------------------------------------------
+
 
 class TestPeriodHandling:
     def test_revenues_is_duration(self, parsed_rows):
@@ -167,6 +169,7 @@ class TestPeriodHandling:
 # 4. Segment disaggregation
 # ---------------------------------------------------------------------------
 
+
 class TestSegmentHandling:
     def test_segment_row_present_when_include_segments_true(self, parsed_rows):
         segment_rows = [r for r in parsed_rows if r.segment is not None]
@@ -193,6 +196,7 @@ class TestSegmentHandling:
 # 5. Unit labels
 # ---------------------------------------------------------------------------
 
+
 class TestUnitLabels:
     def test_monetary_unit_is_usd(self, parsed_rows):
         row = get_fact(parsed_rows, "us-gaap:Revenues")
@@ -213,9 +217,11 @@ class TestUnitLabels:
 # 6. Amendment supersession helper
 # ---------------------------------------------------------------------------
 
+
 class TestAmendmentSupersession:
     def _make_row(self, acc, fact_name, value, period_end=None, segment=None):
         from src.xbrl_parser import FinancialFactRow
+
         return FinancialFactRow(
             accession_number=acc,
             fact_name=fact_name,
@@ -237,9 +243,7 @@ class TestAmendmentSupersession:
 
     def test_original_kept_when_no_amendment(self):
         original = self._make_row("0000-24-000100", "us-gaap:Revenues", 100)
-        result = apply_amendment_supersession(
-            [original], latest_accession="0000-24-000100"
-        )
+        result = apply_amendment_supersession([original], latest_accession="0000-24-000100")
         assert len(result) == 1
         assert result[0].fact_value == Decimal("100")
 
@@ -253,6 +257,7 @@ class TestAmendmentSupersession:
 # ---------------------------------------------------------------------------
 # 7. Low-level helpers
 # ---------------------------------------------------------------------------
+
 
 class TestParseHelpers:
     def test_parse_date_valid(self):
