@@ -25,12 +25,15 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
     Text,
     UniqueConstraint,
+    column,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -49,6 +52,13 @@ class Base(DeclarativeBase):
 # behavior — it is what makes this project's stated testing strategy ("tests
 # run against an in-memory SQLite database") actually hold for ORM-level
 # writes, not just for raw text() queries.
+# SQLite only treats a column as an auto-incrementing alias of the rowid
+# when its declared type is exactly INTEGER; BigInteger compiles to BIGINT
+# there and silently stops autoincrementing (Postgres is unaffected — it
+# uses sequences, not rowid aliasing). All surrogate primary keys use this
+# variant so the schema behaves the same way against the SQLite used in
+# tests as it does against the Postgres used in production.
+_PKBigInteger = BigInteger().with_variant(Integer, "sqlite")
 
 
 class FilingRaw(Base):
@@ -99,6 +109,40 @@ class FinancialFact(Base):
     id: Mapped[int] = mapped_column(
         BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
     )
+    The unique index below is what makes ``load_to_warehouse`` in
+    ``dags/edgar_pipeline.py`` idempotent: re-running the load stage for
+    facts that were already loaded (e.g. an Airflow task retry, or a
+    re-processed amendment) updates the existing row instead of inserting
+    a duplicate. See ``_upsert_facts`` for the ON CONFLICT logic that
+    targets this index.
+
+    A plain ``UniqueConstraint(accession_number, fact_name, period_end,
+    segment)`` would *not* actually prevent duplicates: both Postgres and
+    SQLite treat every NULL as distinct from every other NULL, and
+    ``segment`` is NULL for the large majority of facts (any consolidated,
+    non-segmented value — the common case). Two identical consolidated
+    facts would silently bypass a plain constraint. Instead this uses a
+    unique *expression* index that COALESCEs the nullable columns to
+    sentinel values, so NULL segments/periods are treated consistently
+    for deduplication purposes. The mapped ``period_end``/``segment``
+    attributes themselves are untouched — still nullable, still meaning
+    "no period" / "consolidated" everywhere else (xbrl_parser.py,
+    api/main.py).
+    """
+
+    __tablename__ = "financial_facts"
+    __table_args__ = (
+        Index(
+            "uq_financial_facts_accession_fact_period_segment",
+            "accession_number",
+            "fact_name",
+            func.coalesce(column("period_end"), text("'1900-01-01'")),
+            func.coalesce(column("segment"), text("''")),
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(_PKBigInteger, primary_key=True, autoincrement=True)
     accession_number: Mapped[str] = mapped_column(
         String(25),
         ForeignKey("filings_raw.accession_number", ondelete="CASCADE"),
@@ -132,6 +176,7 @@ class FilingVersion(Base):
     id: Mapped[int] = mapped_column(
         BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
     )
+    id: Mapped[int] = mapped_column(_PKBigInteger, primary_key=True, autoincrement=True)
     cik: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
     filing_type: Mapped[str] = mapped_column(String(10), nullable=False)
     period_of_report: Mapped[date] = mapped_column(Date, nullable=False)
@@ -154,6 +199,7 @@ class PipelineAudit(Base):
     id: Mapped[int] = mapped_column(
         BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
     )
+    id: Mapped[int] = mapped_column(_PKBigInteger, primary_key=True, autoincrement=True)
     run_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     stage: Mapped[str] = mapped_column(
         String(32), nullable=False

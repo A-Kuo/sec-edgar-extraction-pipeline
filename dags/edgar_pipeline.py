@@ -557,6 +557,14 @@ def load_to_warehouse(**context: Any) -> int:
     referencing the same underlying error) if it doesn't — rather than
     guessing at a per-accession result the underlying operation doesn't
     actually produce.
+    Stage 5 — Upsert parsed facts into the PostgreSQL warehouse.
+
+    Idempotent by design: this stage is safe to retry (Airflow is
+    configured with ``retries=2``) or re-run for the same accession
+    numbers without creating duplicate rows in ``financial_facts``. See
+    ``_upsert_facts``.
+
+    Returns the number of rows processed (inserted or updated).
     """
     run_id: str = context["run_id"]
     facts: list[dict] = context["ti"].xcom_pull(key="facts", task_ids="parse_xbrl_facts")
@@ -569,6 +577,7 @@ def load_to_warehouse(**context: Any) -> int:
         else:
             loaded = _bulk_insert_facts(facts or [])
             _write_extraction_audit(run_id, "load", _load_audit_outcomes(facts or [], "success"))
+            loaded = _upsert_facts(facts or [])
 
         _audit_complete(run_id, "load", loaded)
         return loaded
@@ -805,6 +814,64 @@ def _bulk_insert_facts(facts: list[dict]) -> int:
         count = upsert_financial_facts(session, facts)
         session.commit()
     return count
+def _upsert_facts(facts: list[dict]) -> int:
+    """
+    Upsert *facts* into ``financial_facts``, targeting the table's
+    ``uq_financial_facts_accession_fact_period_segment`` unique expression
+    index (see ``src/schema.py``).
+
+    This replaces a plain bulk INSERT specifically to make the load stage
+    idempotent: Airflow retries a failed task (``retries=2`` in
+    ``default_args``), and re-processed amendments legitimately re-parse
+    facts for an accession that was already loaded. Without an upsert,
+    either of those would insert duplicate rows instead of updating the
+    existing ones.
+
+    The ON CONFLICT target must use the *same* COALESCE expressions as
+    the index (not the bare nullable columns), otherwise Postgres/SQLite
+    won't recognize it as matching the index and will fall back to a
+    plain insert — which is exactly the bug a first pass at this function
+    had, caught by tests/test_load_idempotency.py.
+
+    Uses the dialect-appropriate ``INSERT ... ON CONFLICT DO UPDATE``
+    construct (Postgres in production; SQLite in tests), since both
+    dialects expose the same ``on_conflict_do_update`` API.
+    """
+    if not facts:
+        return 0
+
+    from sqlalchemy import create_engine, func, text
+    from src.schema import FinancialFact
+
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    try:
+        if engine.dialect.name == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as _insert
+        else:
+            from sqlalchemy.dialects.postgresql import insert as _insert
+
+        table = FinancialFact.__table__
+        with engine.begin() as conn:
+            stmt = _insert(table).values(facts)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[
+                    table.c.accession_number,
+                    table.c.fact_name,
+                    func.coalesce(table.c.period_end, text("'1900-01-01'")),
+                    func.coalesce(table.c.segment, text("''")),
+                ],
+                set_={
+                    "fact_value": stmt.excluded.fact_value,
+                    "unit": stmt.excluded.unit,
+                    "period_start": stmt.excluded.period_start,
+                    "parsed_at": func.now(),
+                },
+            )
+            conn.execute(stmt)
+    finally:
+        engine.dispose()
+
+    return len(facts)
 
 
 # ---------------------------------------------------------------------------

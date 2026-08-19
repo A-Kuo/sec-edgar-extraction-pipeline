@@ -60,6 +60,18 @@ def sample_ixbrl_bytes(sample_ixbrl_html: str) -> bytes:
     return sample_ixbrl_html.encode("utf-8")
 
 
+@pytest.fixture(scope="session")
+def sample_narrative_10k_html() -> str:
+    """Narrative 10-K fixture (Item 1/1A/7/7A sections) for RAG chunking/retrieval tests."""
+    return (FIXTURES_DIR / "sample_filing_narrative_10k.html").read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="session")
+def sample_narrative_10q_html() -> str:
+    """Narrative 10-Q fixture, distinct accession/content, for cross-document retrieval tests."""
+    return (FIXTURES_DIR / "sample_filing_narrative_10q.html").read_text(encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Airflow test environment
 # ---------------------------------------------------------------------------

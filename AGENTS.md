@@ -9,6 +9,7 @@ Architecture spec and build notes for contributors (human or AI) working on this
 **Status:** Core pipeline (EDGAR client, XBRL parser, schema + migrations, quality checks, Redis cache, Airflow DAG, FastAPI layer) plus an anomaly-detection layer (`src/ml/`), a model registry, CI/CD workflows, and a Docker image are all in place. See [README.md](README.md) for setup and usage.
 
 For *why* the system looks the way it does — real defects found and corrected, with commit hashes and measured before/after, not just the finished state — see [`docs/DECISION_LOG.md`](docs/DECISION_LOG.md).
+**Status:** Core pipeline implemented — EDGAR client, XBRL parser, schema + migrations, quality checks, Redis cache, Airflow DAG, FastAPI layer, and test suite are all in place. A citation-grounded retrieval layer (`src/rag/`, served via `GET /ask/{ticker}`) sits on top of the structured pipeline as an optional research aid — see [README.md](README.md) for setup and usage.
 
 ## Repository Structure
 
@@ -34,6 +35,14 @@ sec-edgar-extraction-pipeline/
 │       └── synthetic.py         # seeded filing generator (CI has no DB)
 ├── api/
 │   └── main.py                 # FastAPI serving layer (8 endpoints)
+│   └── alerts.py               # Slack/SMTP alerting hooks
+│   └── rag/
+│       ├── chunker.py           # Filing text -> provenance-tagged chunks
+│       ├── retrieval.py         # TF-IDF retrieval over chunks
+│       ├── qa.py                # Citation-first answer construction, refusal behavior
+│       └── evaluation.py        # Retrieval recall / citation validity / grounding-accuracy harness
+├── api/
+│   └── main.py                 # FastAPI serving layer (incl. GET /ask/{ticker})
 ├── scripts/
 │   ├── backfill.py             # historical ingestion CLI
 │   ├── validate.py             # manual quality-check CLI
@@ -233,6 +242,20 @@ The `financial_facts.fact_hash` and `model_runs (run_id, model_version)` constra
 
 ### `scripts/train_model.py` / `scripts/evaluate_model.py`
 Training is fully specified by explicit flags (`--seed`, `--contamination`, `--n-estimators`, `--data-seed`) with fixed defaults, so identical flags on identical data reproduce an identical artifact hash — verified in `.github/workflows/ml.yml` by training twice and comparing. `evaluate_model.py` checks absolute floors (recall/precision/ROC-AUC/max flag-rate) and, when a `PRODUCTION` model exists, a regression check against it with a small tolerance for measurement noise; exit code 0 = pass, 1 = failed a floor or regressed, 2 = could not evaluate (missing file, empty registry).
+### `src/rag/` — retrieval layer
+
+Chunks filing text into Item-level sections (`chunker.py`), retrieves the most relevant chunks for a question via TF-IDF (`retrieval.py`), and constructs a citation-first answer (`qa.py`). Deliberately **not** an embedding-based system: the target corpus size (a scoped watchlist, not all of EDGAR) doesn't need one, and TF-IDF keeps retrieval deterministic, offline, and fast to test.
+
+Key behaviors, and why they exist:
+
+- **Refusal, not confident guessing.** `answer_question()` returns `grounded=False` and a fixed refusal string when the best retrieval score is below `MIN_GROUNDING_SCORE` (0.15). This threshold was tuned empirically against the narrative fixtures in `tests/fixtures/sample_filing_narrative_10k.html` / `_10q.html` — see the test history in `tests/test_rag.py` for the calibration process, including a real bug it caught (see below).
+- **Domain-aware stopwords.** SEC boilerplate ("fiscal", "the Company", "this Item") appears in nearly every chunk of nearly every filing and would otherwise dominate cosine similarity for out-of-scope questions that happen to mention a fiscal year. `_FILING_BOILERPLATE_STOPWORDS` in `retrieval.py` strips these before vectorizing.
+- **Sentence-level citation windows, not chunk-start truncation.** A naive `text[:280]` snippet shows the section heading and opening boilerplate, not the sentence that actually supports the answer. `_best_sentence_window()` in `qa.py` picks the sentence with the highest term overlap with the question and starts the snippet there.
+- **Optional LLM synthesis, never required.** If `OPENAI_API_KEY` is set, `_try_llm_synthesis()` asks a model to phrase the answer using *only* the retrieved chunk text. Any failure (missing key, network error, bad response) falls back to the extractive path silently — this keeps `/ask` and its tests fully offline by default.
+
+**Known limitation — entity disambiguation.** A lexical retriever cannot reliably tell "this is about a different company" from "this happens to share financial boilerplate vocabulary." Early testing found "What was Tesla's revenue in fiscal 2024?" scoring *above* the grounding threshold against an Apple-only corpus, purely on the strength of the shared phrase "fiscal 2024." This is mitigated at the API layer: `GET /ask/{ticker}` only ever indexes filings for the requested ticker, so cross-entity confusion mostly can't occur in practice — but the retriever module in isolation (as exercised directly in `tests/test_rag.py`) doesn't solve this itself, and its evaluation cases were revised to test genuine topic-absence (e.g. "return policy for damaged retail products") rather than cross-entity mixups, which are a different, harder problem (would need NER/entity resolution or semantic embeddings, not lexical matching).
+
+**Known limitation — `raw_html` is currently the filing index page, not the primary document.** `download_raw_documents` in `dags/edgar_pipeline.py` fetches the accession's directory-listing HTML, not the actual 10-K/10-Q document body. `/ask` and the RAG tests are validated against realistic narrative fixtures, but will need this ingestion gap closed before returning useful answers against real production data. Fixing this is a data-engineering task (locate and fetch the primary document filename from the index, not the index itself), independent of the retrieval layer.
 
 ### `api/main.py`
 ```
@@ -251,6 +274,10 @@ Filing and fact reads check Redis before PostgreSQL. `/anomalies` and `/model/cu
 - **`ci.yml`** — ruff (lint + format), mypy (`src api scripts`), pytest matrix (3.11/3.12) with a 75% coverage gate, and a dedicated job that applies migrations to a real PostgreSQL service container, asserts every table exists, checks the migrations are reversible (`alembic downgrade base && upgrade head`), runs `alembic check` to catch model/migration drift, and imports the DAG in a subprocess against the real installed Airflow — see `tests/test_dag_import.py`.
 - **`ml.yml`** — trains a candidate on the synthetic corpus, asserts training is reproducible (trains twice, compares artifact hashes), gates it with `evaluate_model.py`, verifies the artifact hash, and runs a two-sided drift-monitor sanity check (quiet on an equivalent population, alerts on a 1000x systematic revenue shift). Triggers on changes to `src/ml/**`, `src/quality.py`, or the training/eval scripts.
 - **`cd.yml`** — on a `v*.*.*` tag: re-runs lint/tests/DAG-import as a release gate, builds a multi-stage Docker image, smoke-tests it (imports the application inside the built container), generates an SBOM, scans for vulnerabilities (reported, not blocking — a HIGH/CRITICAL base-image CVE with no available fix shouldn't block every release), and pushes to GHCR with build provenance attestation.
+GET  /ask/{ticker}                citation-grounded Q&A over the ticker's indexed filing text
+POST /trigger/{ticker}             trigger on-demand ingestion
+```
+All read endpoints check Redis before PostgreSQL and return typed Pydantic models. Unknown ticker/accession returns 404 with a detail message. `/ask` builds its retrieval index on demand from `filings_raw.raw_html` per request rather than caching it — acceptable at the corpus sizes this project targets; worth revisiting (e.g. cache the fitted retriever in Redis, invalidate on new filings) if ticker filing counts grow large enough for TF-IDF fitting to become a latency concern.
 
 ## Testing Strategy
 
@@ -315,6 +342,15 @@ consider opening these as issues there instead of leaving them as prose here.
 - [`docs/DECISION_LOG.md`](docs/DECISION_LOG.md) — real engineering decisions with evidence: defects found and corrected (commit hashes, before/after metrics, the test that proves each fix), and the architecture choices made deliberately from the outset.
 - [`docs/AUDIT_TRAIL_PLAN.md`](docs/AUDIT_TRAIL_PLAN.md) — the design rationale behind the implemented hash-chained audit trail: schema, hash-chain construction, PostgreSQL trigger, and what a hash chain does and doesn't prove (§9 of the decision log has what shipped and what changed from this plan during implementation).
 - [`docs/MICROSERVICE_ALTERNATIVE.md`](docs/MICROSERVICE_ALTERNATIVE.md) — a labeled, never-built comparative design: what a microservice decomposition of this system would look like, and why the monolith was chosen instead, argued from this project's own documented defects rather than general architecture-blog wisdom.
+**Current state:** Core pipeline complete — ingestion, parsing, schema/migrations, quality checks, cache, DAG, API, and tests are all implemented and passing. Citation-grounded retrieval layer (`src/rag/`, `GET /ask/{ticker}`) added with an evaluation harness (`tests/test_rag.py::TestEvaluationHarness`) covering retrieval recall@k, citation validity, and grounding-decision accuracy on a 10-case seed set.
+
+**Next steps (not yet done):**
+- Fix `download_raw_documents` to persist the primary filing document, not the index page (blocks `/ask` from being useful against real ingested data — see "Known limitation" under `src/rag/` above)
+- Grow the RAG evaluation set from 10 seed cases toward the 25-50 recommended for a credible eval, and add cases that stress cross-document/cross-period comparative questions
+- CI workflow (lint/type-check/test on push)
+- `.env.example` for local setup
+- Production deployment guide (current `docker-compose.yml` is local-dev only; no Kubernetes/Helm config exists yet)
+- There is separate, uncommitted work in progress on load-stage idempotency (`_upsert_facts` in `dags/edgar_pipeline.py`, a unique expression index in `src/schema.py`, plus `tests/test_load_idempotency.py`) — unrelated to the RAG layer, not touched by it, and not yet committed as of this update
 
 ## Resources
 

@@ -22,6 +22,7 @@
 [![Docker Ready](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
 
 > A data engineering pipeline that ingests SEC 10-K/10-Q filings, extracts structured financial facts from XBRL, scores them for extraction anomalies, validates data quality, and serves the results through a caching API — with CI/CD gating every change, including the model.
+> A data engineering pipeline that ingests SEC 10-K/10-Q filings, extracts structured financial facts from XBRL, validates data quality, serves the results through a caching API, and answers citation-grounded questions over the filing text itself.
 
 ## Problem
 
@@ -72,6 +73,11 @@ This pipeline automates the full path from raw filing to queryable, versioned, q
 6. **Serve** — a FastAPI layer exposes filings, time-series facts, and anomaly scores, backed by a Redis cache.
 
 The pipeline is orchestrated end-to-end by an Airflow DAG. CI trains and gates the anomaly model on every relevant change, and a tagged release builds and publishes a container image.
+4. **Store** — validated facts land in PostgreSQL with an append-only audit trail and amendment-aware version history.
+5. **Serve** — a FastAPI layer exposes filings and time-series facts, backed by a Redis cache.
+6. **Research** — a retrieval layer chunks filing text into Item-level sections and answers natural-language questions with citations back to the specific accession and section, refusing to answer when nothing in the indexed filings actually supports it.
+
+The structured-extraction pipeline (steps 1-5) is orchestrated end-to-end by an Airflow DAG and runs entirely deterministically — no LLM is involved. The retrieval layer (step 6) is the one place an LLM can optionally participate, and only to *phrase* an answer already constrained to retrieved filing text — never to originate facts. See [Retrieval &amp; Q&amp;A](#retrieval--qa) below.
 
 ## Architecture
 
@@ -181,6 +187,13 @@ sec-edgar-extraction-pipeline/
 │   └── ml/                  # Anomaly detection (features, rules, model, registry, monitoring)
 ├── api/
 │   └── main.py              # FastAPI serving layer (8 endpoints)
+│   └── rag/
+│       ├── chunker.py       # Filing text -> provenance-tagged chunks
+│       ├── retrieval.py     # TF-IDF retrieval over chunks
+│       ├── qa.py            # Citation-first answer construction
+│       └── evaluation.py    # Retrieval recall / citation validity / refusal-accuracy harness
+├── api/
+│   └── main.py              # FastAPI serving layer (includes /ask/{ticker})
 ├── dags/
 │   └── edgar_pipeline.py    # Airflow DAG (9-task pipeline)
 ├── scripts/
@@ -283,6 +296,37 @@ curl http://localhost:8000/model/current
 curl -X POST http://localhost:8000/trigger/AAPL
 ```
 
+### Retrieval &amp; Q&amp;A
+
+```bash
+curl -G http://localhost:8000/ask/AAPL --data-urlencode "q=What supply chain risk does the company describe?"
+```
+
+```json
+{
+  "ticker": "AAPL",
+  "question": "What supply chain risk does the company describe?",
+  "answer": "Based on 10-K 0000320193-24-000123 (Item 1A. Risk Factors): The Company relies on single-source and limited-source suppliers for some components, which increases the Company's supply chain risk...",
+  "grounded": true,
+  "citations": [
+    {"accession_number": "0000320193-24-000123", "section": "Item 1A. Risk Factors", "snippet": "...", "score": 0.34}
+  ]
+}
+```
+
+If nothing in the ticker's indexed filing text is relevant to the question, the response comes back with `"grounded": false` and an explicit refusal instead of a guess:
+
+```bash
+curl -G http://localhost:8000/ask/AAPL --data-urlencode "q=What is the CEO's favorite color?"
+# {"grounded": false, "answer": "I do not find support for this in the supplied filings.", "citations": []}
+```
+
+Run the evaluation harness (retrieval recall@k, citation validity, refusal accuracy) against the seed question set:
+
+```bash
+pytest tests/test_rag.py::TestEvaluationHarness -v
+```
+
 ### Backfill historical data
 
 ```bash
@@ -291,6 +335,41 @@ python scripts/backfill.py \
   --start-date 2020-01-01 \
   --end-date 2024-01-01
 ```
+
+Progress checkpoints to `.backfill_checkpoint.json` after every successfully
+processed filing, so a crash or `Ctrl-C` mid-run doesn't lose completed work:
+
+```bash
+# Resume: skip accessions already completed for this CIK.
+python scripts/backfill.py --cik 0000320193 --start-date 2020-01-01 --resume
+
+# Incremental: only fetch filings newer than the last one this CIK
+# completed, ignoring --start-date for that CIK.
+python scripts/backfill.py --cik 0000320193 --since-last-run
+```
+
+### Analytics: revenue trend and YoY growth by company
+
+`financial_facts` is an OLTP table — one row per fact per filing — so "revenue
+trend for AAPL over 5 years" means hand-writing a pivot query against it.
+Two SQL views (`migrations/versions/0002_analytics_marts.py`) close that gap:
+
+```sql
+-- fct_company_year: one row per (cik, fiscal_year), target facts pivoted into columns
+SELECT fiscal_year, revenue, net_income, total_assets
+FROM fct_company_year
+WHERE cik = '320193'
+ORDER BY fiscal_year;
+
+-- fct_company_year_yoy: same, plus prior-year values and YoY growth %
+SELECT fiscal_year, revenue, revenue_yoy_growth_pct, net_income_yoy_growth_pct
+FROM fct_company_year_yoy
+WHERE cik = '320193'
+ORDER BY fiscal_year;
+```
+
+Both are plain views, not materialized — always consistent with
+`financial_facts` on read, no refresh job needed at this data volume.
 
 ### Run quality checks against a pipeline run
 
@@ -333,6 +412,28 @@ make docker-run   # requires DATABASE_URL / REDIS_URL and a mounted models/ volu
 
 Tagged releases (`vX.Y.Z`) are built and pushed to GHCR automatically by `.github/workflows/cd.yml`, with an SBOM and a Trivy vulnerability scan attached to the run.
 
+## Test Coverage
+
+169 tests, full suite runs in ~6 seconds, no external services required
+(in-memory SQLite, mocked Redis, `MOCK_EDGAR=true` fixture data):
+
+| Module | Tests | What it covers |
+|---|---|---|
+| `test_api.py` | 36 | FastAPI endpoints, Redis cache-then-DB behavior, OpenAPI schema |
+| `test_parser.py` | 34 | XBRL extraction — units, periods, segments, amendment supersession |
+| `test_quality.py` | 28 | Completeness thresholds, PSI drift detection edge cases |
+| `test_dag.py` | 23 | DAG task wiring, mock-mode task callables, alerting trigger rule |
+| `test_rag.py` | 15 | Chunking, TF-IDF retrieval, citation-first QA, evaluation harness |
+| `test_client.py` | 14 | Rate limiting, retry/backoff, 429/503 handling |
+| `test_load_idempotency.py` | 6 | UPSERT dedup on retry/reprocessing, NULL-safety |
+| `test_analytics_marts.py` | 5 | `fct_company_year(_yoy)` views against the real migration |
+| `test_backfill.py` | 8 | Checkpoint persistence, `--resume` / `--since-last-run` filtering |
+
+Structural scale, for context: 7-task Airflow DAG, 6 FastAPI endpoints,
+2 Alembic migrations, 4 warehouse tables + 2 analytics views. There is
+no CI pipeline configured yet — `pytest tests/ -v` passing locally is the
+current bar for a change being considered done (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+
 ## Testing
 
 ```bash
@@ -347,6 +448,17 @@ pytest tests/test_schema.py -v          # ORM models against real SQLite
 pytest tests/test_ml_*.py -v            # features, model, registry, monitoring
 pytest tests/test_scripts_ml.py -v      # train_model.py / evaluate_model.py CLIs
 pytest --cov=src --cov=api --cov=scripts tests/   # with coverage (gated at 75% in CI)
+pytest tests/ -v                     # full suite
+pytest tests/test_api.py -v          # endpoints + caching behavior
+pytest tests/test_client.py -v       # rate limiting, retry/backoff
+pytest tests/test_parser.py -v       # XBRL extraction, units, periods
+pytest tests/test_quality.py -v      # completeness + PSI edge cases
+pytest tests/test_dag.py -v          # DAG structure and task wiring
+pytest tests/test_rag.py -v          # chunking, retrieval, citation-first QA, eval harness
+pytest tests/test_load_idempotency.py -v  # idempotent UPSERT into financial_facts
+pytest tests/test_backfill.py -v     # backfill checkpoint persistence, --resume/--since-last-run filtering
+pytest tests/test_analytics_marts.py -v  # fct_company_year / fct_company_year_yoy views (real migration, real SQL)
+pytest --cov=src --cov=api tests/    # with coverage
 ```
 
 `tests/test_dag.py` mocks Airflow away for fast structural tests; `tests/test_dag_import.py` exists specifically because that mocking once let an Airflow-3-incompatible DAG stay green for 131/131 tests — see that file's docstring.
@@ -366,6 +478,7 @@ Tests run against an in-memory SQLite database and a mocked Redis client, with `
 | `MODEL_REGISTRY_ROOT` | `models` | Directory the anomaly-detection model registry reads/writes |
 
 See [`.env.example`](.env.example) for the full list with inline comments.
+| `OPENAI_API_KEY` | unset | Optional — enables LLM-phrased answers in `/ask`. Without it, answers are extractive (quoted directly from the retrieved chunk); this is the default and what tests exercise |
 
 ## Key Design Decisions
 
@@ -416,6 +529,18 @@ CI pipeline to gate two unrelated notions of "correct."
 | [Transformer-Aspect-Based-Sentiment-Analysis](https://github.com/A-Kuo/Transformer-Aspect-Based-Sentiment-Analysis) | Aspect-level sentiment over MD&A and risk-factor text |
 | [Financial-Economic-Ticker-Analyzer-Agent](https://github.com/A-Kuo/Financial-Economic-Ticker-Analyzer-Agent) | Market-intelligence enrichment keyed on extracted ticker |
 | [Agentic-Visualization-Framework](https://github.com/A-Kuo/Agentic-Visualization-Framework) | Dashboard generation over the structured output |
+- **Drift-aware quality gates.** PSI (Population Stability Index) on extracted fact distributions flags data quality regressions before they reach the warehouse, not after.
+- **Retrieval, not a chatbot.** `/ask` refuses to answer (`grounded: false`) when nothing in the indexed filings scores above a relevance threshold, instead of always producing a confident-sounding response. See "Known failure modes" below for where this still falls short.
+- **TF-IDF over embeddings for retrieval.** The corpus size this project targets (a scoped watchlist of tickers, not all of EDGAR) doesn't need a vector index or GPU dependency. TF-IDF is deterministic, runs offline, and keeps the test suite fast and network-free.
+
+## Known Failure Modes and Mitigations
+
+| Failure mode | Cause | Mitigation |
+|---|---|---|
+| Out-of-scope questions about a *different* company can score above the grounding threshold | Pure lexical retrieval matches shared financial boilerplate ("fiscal 2024", "net sales") even when the entity is wrong | `/ask/{ticker}` scopes the index to one ticker's ingested filings, so cross-entity confusion mostly can't occur through the API; it remains a real limitation of the retriever used in isolation (see `AGENTS.md`) |
+| Citation snippet doesn't contain the supporting sentence | Naive truncation from the start of a chunk cuts off the fact past a heading/boilerplate opener | Citations are built around the sentence with the highest term overlap with the question, not the chunk's first sentence (`_best_sentence_window` in `src/rag/qa.py`) |
+| `download_raw_documents` currently persists the filing *index* page, not the primary document body | Simplification in the initial ingestion implementation | Tracked as a known gap — `/ask` and the RAG tests operate on realistic narrative fixtures; production `raw_html` content needs this fixed before `/ask` returns useful answers against real ingested data |
+| Retrieval quality degrades on very small corpora (few ingested filings for a ticker) | TF-IDF needs enough documents for IDF weighting to be meaningful | `max_df` filtering was intentionally left disabled to avoid `sklearn` errors on single-chunk corpora; expect noisier ranking until a ticker has several filings ingested |
 
 ## Contributing
 
@@ -451,3 +576,4 @@ Issues and questions: [GitHub Issues](https://github.com/A-Kuo/sec-edgar-extract
 ---
 
 **Status:** Core pipeline, ML anomaly-detection layer, model registry, and CI/CD (lint/typecheck/test, model train+gate, Docker build+push to GHCR) complete — 501 tests, 80% coverage on CI-gated modules | **Last updated:** August 2026
+**Status:** Core pipeline complete (ingestion, parsing, quality, caching, API, DAG, tests); citation-grounded retrieval layer (`/ask`) added | **Last updated:** August 2026
